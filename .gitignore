@@ -1,0 +1,31 @@
+.build/
+.engine/
+dist/
+.qa/
+backend/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+*.log
+__pycache__/
+
+# Local credentials and signing material. Intentionally authored test fixtures
+# remain tracked through the exceptions below.
+.env
+.env.*
+!.env.example
+!**/.env.example
+auth.json
+credentials.json
+credentials.*.json
+*.credentials.json
+*token*.json
+secrets.json
+secrets.*.json
+*.pem
+*.key
+*.p12
+*.pfx
+!Tests/**/Fixtures/**
+!Tests/**/fixtures/**

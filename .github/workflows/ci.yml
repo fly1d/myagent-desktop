@@ -1,0 +1,49 @@
+name: macOS CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Swift tests
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Inspect toolchain
+        run: swift --version
+      - name: Run local tests
+        run: ./scripts/test.sh
+
+  bundle:
+    name: Build independent app
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build app with independent backend
+        run: ./scripts/build-app.sh
+      - name: Archive app bundle
+        run: /usr/bin/ditto -c -k --sequesterRsrc --keepParent dist/MyAgent.app dist/MyAgent-macOS.zip
+      - name: Upload development build
+        uses: actions/upload-artifact@v7
+        with:
+          name: MyAgent-macOS-${{ runner.arch }}
+          path: dist/MyAgent-macOS.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
