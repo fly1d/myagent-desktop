@@ -10,6 +10,7 @@ struct WorkspaceView: View {
     @State private var followsLatest = true
     @State private var userIsScrolling = false
     @State private var activeSheet: WorkspaceSheet?
+    @State private var sheetIsDismissing = false
 
     private var colorScheme: ColorScheme? {
         appearance == "dark" ? .dark : appearance == "light" ? .light : nil
@@ -45,6 +46,7 @@ struct WorkspaceView: View {
                 if !model.canRun { connectionNotice }
                 if let error = model.lastError { errorNotice(error) }
                 if needsReview { reviewNotice }
+                else if model.canResumeTask { resumeNotice }
                 conversation
                 composer
             }
@@ -64,12 +66,19 @@ struct WorkspaceView: View {
                     .help("项目文件与执行详情")
             }
         }
-        .sheet(item: sheetBinding, onDismiss: { DispatchQueue.main.async { synchronizeSheet() } }) { sheet in
+        .sheet(item: sheetBinding, onDismiss: {
+            sheetIsDismissing = false
+            DispatchQueue.main.async { synchronizeSheet() }
+        }) { sheet in
             Group {
                 switch sheet {
                 case .connection: ConnectionSetupView(model: model)
                 case .permission(let id):
                     if let request = model.pendingPermission, request.id == id { PermissionSheet(model: model, request: request) }
+                case .question(let id):
+                    if let question = model.pendingQuestion, question.id == id {
+                        UserQuestionView(model: model, question: question).id(question.id)
+                    }
                 case .choice(let id):
                     if let choice = model.pendingChoice, choice.id == id { ChoiceSheet(model: model, choice: choice) }
                 case .preview: FilePreviewSheet(model: model)
@@ -79,6 +88,7 @@ struct WorkspaceView: View {
         .onAppear { synchronizeSheet() }
         .onChange(of: model.showConnectionSetup) { _, _ in synchronizeSheet() }
         .onChange(of: model.pendingPermission?.id) { _, _ in synchronizeSheet() }
+        .onChange(of: model.pendingQuestion?.id) { _, _ in synchronizeSheet() }
         .onChange(of: model.pendingChoice?.id) { _, _ in synchronizeSheet() }
         .onChange(of: model.showPreview) { _, _ in synchronizeSheet() }
     }
@@ -188,6 +198,20 @@ struct WorkspaceView: View {
             Button("继续核验", action: model.continueReview).disabled(!model.canRun || model.isBusy)
                 .controlSize(.small)
         }.padding(.horizontal, 24).padding(.vertical, 12).background(Color.orange.opacity(0.06))
+    }
+
+    private var resumeNotice: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.currentTask?.phase == .paused ? "任务已暂停" : "上次执行未完成")
+                    .font(.system(size: 13, weight: .medium))
+                Text("从已有上下文继续；输入框里的草稿会保留，不会自动发送。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            Button("继续此任务", action: model.resumeTask)
+                .disabled(!model.canRun || model.isBusy).controlSize(.small)
+        }.padding(.horizontal, 24).padding(.vertical, 12).background(Color.primary.opacity(0.025))
     }
 
     private func errorNotice(_ text: String) -> some View {
@@ -394,11 +418,13 @@ struct WorkspaceView: View {
     private var sheetBinding: Binding<WorkspaceSheet?> {
         Binding(get: { activeSheet }, set: { next in
             if next == nil, let old = activeSheet {
+                sheetIsDismissing = true
                 switch old {
                 case .connection: model.showConnectionSetup = false
                 case .preview: model.showPreview = false
-                case .permission: if model.pendingPermission != nil { model.respondPermission(false) }
-                case .choice: if model.pendingChoice != nil { model.declineChoice() }
+                case .permission(let id): if model.pendingPermission?.id == id { model.respondPermission(false) }
+                case .question(let id): if model.pendingQuestion?.id == id { model.dismissQuestion() }
+                case .choice(let id): if model.pendingChoice?.id == id { model.declineChoice() }
                 }
             }
             activeSheet = next
@@ -406,18 +432,24 @@ struct WorkspaceView: View {
     }
 
     private func synchronizeSheet() {
+        guard !sheetIsDismissing else { return }
         if let sheet = activeSheet {
             let valid: Bool
             switch sheet {
             case .connection: valid = model.showConnectionSetup
             case .permission(let id): valid = model.pendingPermission?.id == id
+            case .question(let id): valid = model.pendingQuestion?.id == id
             case .choice(let id): valid = model.pendingChoice?.id == id
             case .preview: valid = model.showPreview
             }
-            if !valid { activeSheet = nil }
+            if !valid {
+                sheetIsDismissing = true
+                activeSheet = nil
+            }
             return
         }
         if model.pendingPermission != nil { activeSheet = .permission(model.pendingPermission!.id) }
+        else if model.pendingQuestion != nil { activeSheet = .question(model.pendingQuestion!.id) }
         else if model.pendingChoice != nil { activeSheet = .choice(model.pendingChoice!.id) }
         else if model.showConnectionSetup { activeSheet = .connection }
         else if model.showPreview { activeSheet = .preview }
@@ -425,11 +457,12 @@ struct WorkspaceView: View {
 }
 
 private enum WorkspaceSheet: Identifiable {
-    case connection, permission(UUID), choice(UUID), preview
+    case connection, permission(UUID), question(UUID), choice(UUID), preview
     var id: String {
         switch self {
         case .connection: return "connection"
         case .permission(let id): return "permission-\(id)"
+        case .question(let id): return "question-\(id)"
         case .choice(let id): return "choice-\(id)"
         case .preview: return "preview"
         }

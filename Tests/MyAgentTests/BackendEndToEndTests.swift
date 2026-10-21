@@ -128,6 +128,179 @@ struct BackendEndToEndTests {
         fixture.stop()
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func openQuestionAnswerFlowsThroughRealBackendIntoVerifiedFile() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let model = fixture.makeModel(MemoryCredentialStore())
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            model.settings.proactive = false
+            model.draft = "ask-open-question"
+            model.sendPrompt()
+            try await eventually("native open question") { model.pendingQuestion != nil }
+            let question = try #require(model.pendingQuestion)
+            #expect(question.question == "这份报告应该写给谁？")
+            #expect(question.context == "需要称呼来生成报告。")
+            #expect(question.placeholder == "例如：开发团队")
+            #expect(question.options.isEmpty)
+            #expect(model.pendingPermission == nil)
+            #expect(!FileManager.default.fileExists(atPath: fixture.report.path))
+            model.answerQuestion("开发团队")
+            try await eventually("file approval after actual question tool result") { model.pendingPermission != nil }
+            #expect(model.pendingQuestion == nil)
+            #expect(model.pendingPermission?.detail.contains("致开发团队") == true)
+            #expect(fixture.lastQuestionResult?["answer"] as? String == "开发团队")
+            #expect(fixture.lastQuestionResult?["cancelled"] as? Bool == false)
+            model.respondPermission(true)
+            try await eventually("question answer produces verified deliverable") { !model.isBusy }
+            #expect(model.currentTask?.phase == .completed)
+            #expect(try String(contentsOf: fixture.report, encoding: .utf8) == "致开发团队：你好，后端实际写入。\n")
+            #expect(try fixture.receipts().count == 1)
+            #expect(model.currentTask?.messages.contains { $0.text == "已根据回答写入、读回并验收。" } == true)
+            try await model.shutdownAndWait()
+        } catch { try? await model.shutdownAndWait(); fixture.stop(); throw error }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func dismissingQuestionReturnsCancellationAndIgnoresLateAnswer() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let model = fixture.makeModel(MemoryCredentialStore())
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            model.settings.proactive = false
+            model.draft = "ask-cancel-question"
+            model.sendPrompt()
+            try await eventually("question to cancel") { model.pendingQuestion != nil }
+            model.dismissQuestion()
+            model.answerQuestion("迟到回答不能触发交付")
+            try await eventually("cancelled answer reaches model without delivery") { !model.isBusy }
+            #expect(model.pendingQuestion == nil)
+            #expect(model.pendingPermission == nil)
+            #expect(fixture.lastQuestionResult?["answer"] is NSNull)
+            #expect(fixture.lastQuestionResult?["cancelled"] as? Bool == true)
+            #expect(!fixture.requestsContain("迟到回答不能触发交付"))
+            #expect(!FileManager.default.fileExists(atPath: fixture.report.path))
+            #expect(try fixture.receipts().isEmpty)
+            #expect(model.currentTask?.phase == .needsReview)
+            try await model.shutdownAndWait()
+        } catch { try? await model.shutdownAndWait(); fixture.stop(); throw error }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func stoppingWhileQuestionWaitsRevokesItsAnswerContinuation() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let model = fixture.makeModel(MemoryCredentialStore())
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            model.settings.proactive = false
+            model.draft = "ask-stop-question"
+            model.sendPrompt()
+            try await eventually("question before task stop") { model.pendingQuestion != nil }
+            model.stop()
+            model.answerQuestion("停止后的迟到回答")
+            #expect(model.pendingQuestion == nil)
+            #expect(!model.isBusy)
+            #expect(model.currentTask?.phase == .paused)
+            try await model.shutdownAndWait()
+            #expect(model.pendingPermission == nil)
+            #expect(!fixture.requestsContain("停止后的迟到回答"))
+            #expect(!FileManager.default.fileExists(atPath: fixture.report.path))
+            #expect(try fixture.receipts().isEmpty)
+        } catch { try? await model.shutdownAndWait(); fixture.stop(); throw error }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func explicitResumeAfterHTTPFailureKeepsThreadDraftAndOriginalPrompt() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let model = fixture.makeModel(MemoryCredentialStore())
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            model.settings.proactive = false
+            model.draft = "resume-after-http-failure"
+            model.sendPrompt()
+            try await eventually("fixture HTTP failure") { !model.isBusy }
+            #expect(model.currentTask?.phase == .failed)
+            let thread = try #require(model.currentTask?.engineID)
+            model.draft = "保留这条未发送草稿"
+            #expect(model.canResumeTask)
+            model.resumeTask()
+            try await eventually("resumed task's file approval") { model.pendingPermission != nil }
+            #expect(model.currentTask?.engineID == thread)
+            #expect(model.draft == "保留这条未发送草稿")
+            model.respondPermission(true)
+            try await eventually("explicit resume completes actual delivery") { !model.isBusy }
+            #expect(model.currentTask?.phase == .completed)
+            #expect(model.currentTask?.engineID == thread)
+            #expect(model.draft == "保留这条未发送草稿")
+            expectSingleOriginalPrompt(model, fixture, draft: "保留这条未发送草稿")
+            #expect(try String(contentsOf: fixture.report, encoding: .utf8) == "你好，后端实际写入。\n")
+            #expect(try fixture.receipts().count == 1)
+            try await model.shutdownAndWait()
+        } catch { try? await model.shutdownAndWait(); fixture.stop(); throw error }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func failedTaskCanReopenAndResumeWithoutSendingOriginalPromptOrDraftAgain() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let secrets = MemoryCredentialStore()
+        let model = fixture.makeModel(secrets)
+        var reopened: AppModel?
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            model.settings.proactive = false
+            model.draft = "resume-after-http-failure"
+            model.sendPrompt()
+            try await eventually("HTTP failure before reopening") { !model.isBusy }
+            #expect(model.currentTask?.phase == .failed)
+            let task = try #require(model.selectedTaskID)
+            let thread = try #require(model.currentTask?.engineID)
+            model.draft = "重开后仍需保留的未发送草稿"
+            try await model.shutdownAndWait()
+
+            let restored = fixture.makeModel(secrets)
+            reopened = restored
+            await restored.connect()
+            #expect(restored.selectedTaskID == task)
+            #expect(restored.currentTask?.engineID == thread)
+            #expect(restored.draft == "重开后仍需保留的未发送草稿")
+            #expect(restored.canResumeTask)
+            restored.resumeTask()
+            try await eventually("reopened task's approval") { restored.pendingPermission != nil }
+            restored.respondPermission(true)
+            try await eventually("reopened task delivers and verifies") { !restored.isBusy }
+            #expect(restored.currentTask?.phase == .completed)
+            #expect(restored.currentTask?.engineID == thread)
+            #expect(restored.draft == "重开后仍需保留的未发送草稿")
+            expectSingleOriginalPrompt(restored, fixture, draft: "重开后仍需保留的未发送草稿")
+            #expect(try fixture.receipts().count == 1)
+            try await restored.shutdownAndWait()
+        } catch {
+            try? await model.shutdownAndWait()
+            if let reopened { try? await reopened.shutdownAndWait() }
+            fixture.stop()
+            throw error
+        }
+        fixture.stop()
+    }
+
+    private func expectSingleOriginalPrompt(_ model: AppModel, _ fixture: HTTPModelFixture, draft: String) {
+        #expect(model.currentTask?.messages.filter { $0.role == "user" && $0.text == "resume-after-http-failure" }.count == 1)
+        #expect(!fixture.requestsContain(draft))
+        for request in fixture.requests {
+            let messages = request["messages"] as? [[String: Any]] ?? []
+            #expect(messages.filter { $0["role"] as? String == "user" && $0["content"] as? String == "resume-after-http-failure" }.count == 1)
+        }
+    }
+
     private func configure(_ model: AppModel, _ fixture: HTTPModelFixture) async throws {
         model.providerDraft = fixture.provider
         model.apiKeyDraft = HTTPModelFixture.key
@@ -157,6 +330,24 @@ private final class HTTPModelFixture {
     var report: URL { data.appendingPathComponent("Workspace/deliverables/report.txt") }
     var provider: ProviderDraft { ProviderDraft(kind: "custom", baseURL: address, model: "fixture-agent") }
     var requestCount: Int { ((try? Data(contentsOf: directory.appendingPathComponent("requests.json"))).flatMap { try? JSONSerialization.jsonObject(with: $0, options: [.fragmentsAllowed]) as? Int }) ?? 0 }
+    var requests: [[String: Any]] {
+        guard let text = try? String(contentsOf: directory.appendingPathComponent("request-bodies.jsonl"), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap { line in
+            guard let bytes = String(line).data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
+        }
+    }
+    var lastQuestionResult: [String: Any]? {
+        guard let bytes = try? Data(contentsOf: directory.appendingPathComponent("question-result.json")) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
+    }
+
+    func requestsContain(_ text: String) -> Bool {
+        requests.contains { request in
+            guard let data = try? JSONSerialization.data(withJSONObject: request) else { return false }
+            return String(decoding: data, as: UTF8.self).contains(text)
+        }
+    }
 
     private init() throws {
         directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("myagent-e2e-\(UUID().uuidString)")
@@ -218,19 +409,46 @@ private final class HTTPModelFixture {
             names = {t['function']['name'] for t in request['tools']}
             assert {'write_file','read_file','complete_task'}.issubset(names)
             count += 1; (root/'requests.json').write_text(json.dumps(count))
+            with (root/'request-bodies.jsonl').open('a') as log: log.write(json.dumps(request,ensure_ascii=False)+'\n')
             messages = request['messages']; user_index = max(i for i,m in enumerate(messages) if m['role']=='user')
             mode = messages[user_index]['content']; results = [m for m in messages[user_index+1:] if m['role']=='tool']; stage=len(results)
+            scenario = next(m['content'] for m in messages if m['role']=='user')
+            if scenario == 'resume-after-http-failure' and not (root/'failed-once').exists():
+                (root/'failed-once').touch()
+                body = json.dumps({'error':{'message':'isolated fixture transient failure'}}).encode()
+                self.send_response(500); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+            def tool_value(message):
+                value = json.loads(message['content'])
+                if isinstance(value,dict) and 'contentItems' in value:
+                    assert value.get('success') is True
+                    return json.loads(next(item['text'] for item in value['contentItems'] if item['type']=='inputText'))
+                return value
             call = None; text = ''
-            if mode == 'deny-write':
+            expected = '你好，后端实际写入。\n'
+            asking = scenario in ('ask-open-question','ask-cancel-question','ask-stop-question')
+            if asking and stage == 0:
+                assert 'ask_user' in names
+                call = ('ask_user', {'question':'这份报告应该写给谁？','context':'需要称呼来生成报告。','placeholder':'例如：开发团队'})
+            elif asking and scenario in ('ask-cancel-question','ask-stop-question'):
+                answer = tool_value(results[0]); (root/'question-result.json').write_text(json.dumps(answer,ensure_ascii=False))
+                assert answer.get('answer') is None and answer.get('cancelled') is True
+                text = '已取消提问，未继续交付。'
+            elif mode == 'deny-write':
                 if stage < 2: call = ('write_file', {'path':'deliverables/report.txt','content':'你好，后端实际写入。\n'})
                 else: text = '用户拒绝，未写入文件。'
-            elif stage == 0: call = ('write_file', {'path':'deliverables/report.txt','content':'你好，后端实际写入。\n'})
-            elif stage == 1: call = ('read_file', {'path':'deliverables/report.txt'})
-            elif stage == 2:
-                actual = json.loads(results[-1]['content'])
-                assert actual['content'] == '你好，后端实际写入。\n'
-                call = ('complete_task', {'summary':'真实后端已写入并读回项目文件','artifacts':['deliverables/report.txt'],'verification':['read_file 实际返回预期的中文文件内容']})
-            else: text = '已写入、读回并验收。'
+            else:
+                if asking:
+                    answer = tool_value(results[0]); (root/'question-result.json').write_text(json.dumps(answer,ensure_ascii=False))
+                    assert answer == {'answer':'开发团队','cancelled':False}
+                    expected = '致'+answer['answer']+'：你好，后端实际写入。\n'
+                    stage -= 1
+                if stage == 0: call = ('write_file', {'path':'deliverables/report.txt','content':expected})
+                elif stage == 1: call = ('read_file', {'path':'deliverables/report.txt'})
+                elif stage == 2:
+                    actual = json.loads(results[-1]['content'])
+                    assert actual['content'] == expected
+                    call = ('complete_task', {'summary':'真实后端已写入并读回项目文件','artifacts':['deliverables/report.txt'],'verification':['read_file 实际返回预期的中文文件内容']})
+                else: text = '已根据回答写入、读回并验收。' if asking else '已写入、读回并验收。'
             self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
             def event(delta, reason=None):
                 data = {'choices':[{'index':0,'delta':delta,'finish_reason':reason}]}

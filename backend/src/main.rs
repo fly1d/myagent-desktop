@@ -124,14 +124,22 @@ async fn main() -> Result<()> {
         let method = method.to_owned();
         let params = message.get("params").cloned().unwrap_or(json!({}));
         let task_state = state.clone();
-        // Provider HTTP, turn execution, and native approvals must never block stdin replies.
-        tokio::spawn(async move {
+        // State/control RPCs must preserve pipe order: an interrupt arriving
+        // after turn/start must see that turn. Only provider/test performs HTTP
+        // inline; model turns and native approvals already run independently.
+        let background = method == "provider/test";
+        let respond = async move {
             let response = match dispatch(task_state.clone(), &method, params).await {
                 Ok(result) => json!({"id":id,"result":result}),
                 Err(error) => json!({"id":id,"error":{"code":-32603,"message":error.to_string()}}),
             };
             let _ = task_state.send(response);
-        });
+        };
+        if background {
+            tokio::spawn(respond);
+        } else {
+            respond.await;
+        }
     }
     state.cancel_all();
     // Let cancellation finalize durable status and terminate command children.

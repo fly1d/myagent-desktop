@@ -25,6 +25,7 @@ final class AppModel: ObservableObject {
     @Published var artifacts: [ArtifactItem] = []
     @Published var pendingPermission: PendingPermission?
     @Published var pendingChoice: PendingChoice?
+    @Published var pendingQuestion: PendingQuestion?
     @Published var browserTitle = "独立浏览器尚未打开"
     @Published var browserImage: NSImage?
     @Published var desktopStatus = "未请求辅助功能权限"
@@ -64,6 +65,7 @@ final class AppModel: ObservableObject {
     private var permissionReply: ((Bool) -> Void)?
     private var permissionExpiryTask: Task<Void, Never>?
     private var choiceReply: ((String?) -> Void)?
+    private var questionReply: ((String?) -> Void)?
     private var leases: [String: Date] = [:]
     private var leaseTimer: Task<Void, Never>?
     private var completionAccepted = false
@@ -73,6 +75,9 @@ final class AppModel: ObservableObject {
     var currentTask: AgentTask? { tasks.first { $0.id == selectedTaskID } }
     var isBusy: Bool { activeTaskID != nil }
     var canRun: Bool { isConnected && hasCredentials && !isConnecting && !isTestingConnection }
+    var canResumeTask: Bool {
+        !isBusy && canRun && currentTask.map { [.paused, .failed].contains($0.phase) && !$0.messages.isEmpty } == true
+    }
     var workspacePath: String { currentTask?.workspace ?? defaultWorkspace.path }
 
     init(dataDirectory: URL? = nil, engineBinary: URL? = nil, credentialStore: (any CredentialStore)? = nil, usesBackendPersistence: Bool? = nil) {
@@ -401,6 +406,8 @@ final class AppModel: ObservableObject {
         guard let id = selectedTaskID, let index = tasks.firstIndex(where: { $0.id == id }) else { return }
         if tasks[index].messages.isEmpty { tasks[index].title = String(prompt.prefix(30)) }
         tasks[index].messages.append(ChatEntry(role: "user", text: prompt))
+        tasks[index].pendingInput = prompt
+        tasks[index].pendingTurnID = UUID().uuidString.lowercased()
         tasks[index].automaticRounds = 0
         tasks[index].updatedAt = Date()
         draft = ""
@@ -415,31 +422,52 @@ final class AppModel: ObservableObject {
         Task { await startTurn(taskID: id, text: prompt, generation: generation) }
     }
 
-    private func startTurn(taskID: UUID, text: String, generation: UUID) async {
+    private func startTurn(taskID: UUID, text: String, generation: UUID, recovering: Bool = false) async {
         guard let index = tasks.firstIndex(where: { $0.id == taskID }), generation == runGeneration else { return }
         let ticket = UUID()
         turnStartTicket = ticket
         tasks[index].phase = .connecting
         do {
+            var input = text
             var threadID = tasks[index].engineID
             if threadID == nil {
                 var params: [String: Any] = ["cwd": tasks[index].workspace, "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": "workspace-write", "dynamicTools": Self.dynamicTools, "developerInstructions": Self.instructions]
                 if let model = settings.model, !model.isEmpty { params["model"] = model }
                 let result = try await connection.call("thread/start", params: params)
+                try ensureRunning(generation)
                 threadID = (result["thread"] as? [String: Any])?["id"] as? String
                 guard let threadID else { throw AppFailure.message("运行时未创建任务。") }
                 guard let i = tasks.firstIndex(where: { $0.id == taskID }) else { return }
                 tasks[i].engineID = threadID
                 resumedThreads.insert(threadID)
-            } else if let existing = threadID, !resumedThreads.contains(existing) {
-                var resume: [String: Any] = ["threadId": existing, "cwd": tasks[index].workspace, "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": "workspace-write"]
+            } else if let existing = threadID, recovering || !resumedThreads.contains(existing) {
+                var resume: [String: Any] = ["threadId": existing, "cwd": tasks[index].workspace, "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": "workspace-write", "dynamicTools": Self.dynamicTools, "developerInstructions": Self.instructions]
                 if let model = settings.model, !model.isEmpty { resume["model"] = model }
-                _ = try await connection.call("thread/resume", params: resume)
+                var response = try await connection.call("thread/resume", params: resume)
+                try ensureRunning(generation)
+                if recovering {
+                    response = try await settlePreviousTurn(threadID: existing, response: response, generation: generation)
+                }
+                if recovering, let i = tasks.firstIndex(where: { $0.id == taskID }), let pendingID = tasks[i].pendingTurnID {
+                    let turns = (response["thread"] as? [String: Any])?["turns"] as? [[String: Any]] ?? []
+                    if turns.contains(where: { ($0["id"] as? String)?.lowercased() == pendingID.lowercased() }) {
+                        // Its user message is already in SQLite, even if the
+                        // native app never received the original RPC reply.
+                        tasks[i].pendingInput = nil
+                        tasks[i].pendingTurnID = nil
+                    }
+                }
                 resumedThreads.insert(existing)
             }
             guard generation == runGeneration, let threadID else { return }
+            guard let i = tasks.firstIndex(where: { $0.id == taskID }) else { return }
+            if recovering, let pending = tasks[i].pendingInput { input = pending }
+            if tasks[i].pendingTurnID == nil { tasks[i].pendingTurnID = UUID().uuidString.lowercased() }
+            tasks[i].pendingInput = input
+            let submittedID = tasks[i].pendingTurnID!
+            persist()
             startingTurn = true
-            var turnParams: [String: Any] = ["threadId": threadID, "input": [["type": "text", "text": text]]]
+            var turnParams: [String: Any] = ["threadId": threadID, "clientTurnId": submittedID, "input": [["type": "text", "text": input]]]
             if let model = settings.model, !model.isEmpty { turnParams["model"] = model }
             let result = try await connection.call("turn/start", params: turnParams)
             let newTurnID = (result["turn"] as? [String: Any])?["id"] as? String
@@ -449,6 +477,11 @@ final class AppModel: ObservableObject {
             }
             // Events may finish this turn and start a follow-up before the RPC reply arrives.
             guard ticket == turnStartTicket, activeTaskID == taskID else { return }
+            guard let newTurnID else { throw AppFailure.message("后端未返回有效的执行轮次。") }
+            if let i = tasks.firstIndex(where: { $0.id == taskID }) {
+                tasks[i].pendingInput = nil
+                tasks[i].pendingTurnID = nil
+            }
             turnID = newTurnID
             startingTurn = false
             setPhase(.running, taskID)
@@ -468,14 +501,38 @@ final class AppModel: ObservableObject {
             setPhase(.failed, taskID)
             activeTaskID = nil
             lastError = error.localizedDescription
+            if let task = tasks.first(where: { $0.id == taskID }), let threadID = task.engineID, let pendingID = task.pendingTurnID {
+                _ = try? await connection.call("turn/interrupt", params: ["threadId": threadID, "turnId": pendingID.lowercased()])
+            }
             persist()
+        }
+    }
+
+    private func settlePreviousTurn(threadID: String, response: [String: Any], generation: UUID) async throws -> [String: Any] {
+        var latest = response
+        var interrupted = Set<String>()
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while true {
+            try ensureRunning(generation)
+            let turns = (latest["thread"] as? [String: Any])?["turns"] as? [[String: Any]] ?? []
+            let running = turns.filter { $0["status"] as? String == "inProgress" }.compactMap { $0["id"] as? String }
+            if running.isEmpty { return latest }
+            for id in running where interrupted.insert(id).inserted {
+                _ = try await connection.call("turn/interrupt", params: ["threadId": threadID, "turnId": id])
+                try ensureRunning(generation)
+            }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw AppFailure.message("上轮执行仍在停止，请稍后点击继续此任务。")
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+            latest = try await connection.call("thread/resume", params: ["threadId": threadID])
         }
     }
 
     func stop() {
         let active = activeTaskID
         let thread = tasks.first { $0.id == active }?.engineID
-        let turn = turnID
+        let turn = turnID ?? tasks.first { $0.id == active }?.pendingTurnID?.lowercased()
         runGeneration = UUID()
         turnStartTicket = UUID()
         startingTurn = false
@@ -491,6 +548,7 @@ final class AppModel: ObservableObject {
         activeControlScope = nil
         respondPermission(false)
         declineChoice()
+        dismissQuestion()
         if let active { setPhase(.paused, active); log("任务已停止", "后续工具动作与控制授权已撤销。") }
         activeTaskID = nil
         turnID = nil
@@ -616,16 +674,21 @@ final class AppModel: ObservableObject {
                 connection.respond(id: id, result: ["decision": allowed && generation == runGeneration ? "accept" : "decline"])
             } else if method == "item/tool/requestUserInput" {
                 var answers: [String: Any] = [:]
-                for question in params["questions"] as? [[String: Any]] ?? [] {
-                    let options = (question["options"] as? [[String: Any]] ?? []).enumerated().map { index, option in
-                        ChoiceCard(id: String(index), title: option["label"] as? String ?? "选项", description: option["description"] as? String ?? "", deliverables: [], previewPaths: [], impact: "", nextStep: "按此选项继续")
+                do {
+                    let questions = params["questions"] as? [[String: Any]] ?? []
+                    guard (1...3).contains(questions.count), !questions.contains(where: { $0["isSecret"] as? Bool == true }) else {
+                        throw AppFailure.message("一次可询问 1–3 个普通问题；密钥请在连接设置中配置。")
                     }
-                    guard !options.isEmpty else { connection.respondError(id: id, message: "Free text input is not supported by this client yet. Ask in chat."); return }
-                    let chosen = await askChoice(PendingChoice(title: question["question"] as? String ?? "请选择", options: options))
-                    let label = options.first { $0.id == chosen }?.title
-                    answers[question["id"] as? String ?? "question"] = ["answers": label.map { [$0] } ?? []]
-                }
-                connection.respond(id: id, result: ["answers": answers])
+                    for question in questions {
+                        let options = (question["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String }
+                        let request = try Self.questionRequest(["question": question["question"] ?? "", "options": options])
+                        let answer = await askQuestion(request)
+                        try ensureRunning(generation)
+                        answers[question["id"] as? String ?? "question"] = ["answers": answer.map { [$0] } ?? []]
+                        if answer == nil { break }
+                    }
+                    connection.respond(id: id, result: ["answers": answers])
+                } catch { connection.respondError(id: id, message: error.localizedDescription) }
             } else { connection.respondError(id: id, message: "Unsupported request: \(method)") }
         }
     }
@@ -633,6 +696,11 @@ final class AppModel: ObservableObject {
     private func runTool(_ name: String, args: [String: Any], task: AgentTask, generation: UUID) async throws -> [String: Any] {
         try ensureRunning(generation)
         switch name {
+        case "ask_user":
+            let question = try Self.questionRequest(args)
+            let answer = await askQuestion(question)
+            try ensureRunning(generation)
+            return ["answer": answer as Any? ?? NSNull(), "cancelled": answer == nil]
         case "present_choices":
             let data = try JSONSerialization.data(withJSONObject: args["options"] ?? [])
             let choices = try JSONDecoder().decode([ChoiceCard].self, from: data)
@@ -710,7 +778,7 @@ final class AppModel: ObservableObject {
     }
 
     private func askPermission(title: String, detail: String, scope: String, kind: String) async -> Bool {
-        guard pendingPermission == nil, !Task.isCancelled else { return false }
+        guard pendingPermission == nil, pendingChoice == nil, pendingQuestion == nil, !Task.isCancelled else { return false }
         return await withCheckedContinuation { continuation in
             let request = PendingPermission(title: title, detail: detail, scope: scope, kind: kind)
             pendingPermission = request
@@ -736,7 +804,7 @@ final class AppModel: ObservableObject {
     }
 
     private func askChoice(_ choice: PendingChoice) async -> String? {
-        guard pendingChoice == nil, !Task.isCancelled else { return nil }
+        guard pendingChoice == nil, pendingPermission == nil, pendingQuestion == nil, !Task.isCancelled else { return nil }
         return await withCheckedContinuation { continuation in
             pendingChoice = choice
             choiceReply = { continuation.resume(returning: $0) }
@@ -760,6 +828,70 @@ final class AppModel: ObservableObject {
         choiceReply = nil
         if let activeTaskID { setPhase(.running, activeTaskID) }
         callback?(nil)
+    }
+
+    private static func questionRequest(_ args: [String: Any]) throws -> PendingQuestion {
+        let question = (args["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let context = args["context"] as? String ?? ""
+        let placeholder = args["placeholder"] as? String ?? "输入你的回答…"
+        let options = args["options"] as? [String] ?? []
+        guard !question.isEmpty, question.count <= 2_000, context.count <= 8_000,
+              placeholder.count <= 200, options.count <= 4,
+              options.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 300 }) else {
+            throw AppFailure.message("问题内容无效：问题应在 2,000 字内，可附最多 4 个建议答案。")
+        }
+        return PendingQuestion(question: question, context: context, options: options, placeholder: placeholder)
+    }
+
+    private func askQuestion(_ question: PendingQuestion) async -> String? {
+        guard pendingQuestion == nil, pendingPermission == nil, pendingChoice == nil, !Task.isCancelled else { return nil }
+        return await withCheckedContinuation { continuation in
+            pendingQuestion = question
+            questionReply = { continuation.resume(returning: $0) }
+            if let activeTaskID, let i = tasks.firstIndex(where: { $0.id == activeTaskID }) {
+                let text = question.question + (question.context.isEmpty ? "" : "\n\n" + question.context)
+                tasks[i].messages.append(ChatEntry(role: "assistant", text: text))
+                setPhase(.waiting, activeTaskID)
+            }
+            if !settings.quietMode { NSSound.beep() }
+            persist()
+        }
+    }
+
+    func answerQuestion(_ answer: String) {
+        let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard pendingQuestion != nil, !text.isEmpty, text.count <= 4_000 else { return }
+        let callback = questionReply
+        questionReply = nil
+        pendingQuestion = nil
+        if let activeTaskID, let i = tasks.firstIndex(where: { $0.id == activeTaskID }) {
+            tasks[i].messages.append(ChatEntry(role: "user", text: text))
+            setPhase(.running, activeTaskID)
+        }
+        persist()
+        callback?(text)
+    }
+
+    func dismissQuestion() {
+        let callback = questionReply
+        questionReply = nil
+        pendingQuestion = nil
+        if let activeTaskID { setPhase(.running, activeTaskID) }
+        callback?(nil)
+    }
+
+    func resumeTask() {
+        guard canResumeTask, let id = selectedTaskID, let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        activeTaskID = id
+        runGeneration = UUID()
+        tasks[i].automaticRounds = 0
+        completionAccepted = false
+        completionReview = nil
+        lastError = nil
+        log("继续任务", "先检查已有结果，再继续未完成的工作；未发送的草稿保留。")
+        let generation = runGeneration
+        let prompt = "继续此任务。先检查已有交付物和上轮失败或中断的记录，继续原用户已授权但未完成的工作。已拒绝的动作不得再次尝试。若中断在提问阶段，应重新询问必要的信息；不要猜测答案。完成后用实际依据调用 complete_task。"
+        Task { await startTurn(taskID: id, text: prompt, generation: generation, recovering: true) }
     }
 
     func continueReview() {
@@ -872,6 +1004,7 @@ final class AppModel: ObservableObject {
     static let instructions = """
     You are the agent inside MyAgent, an independently maintained macOS application. Follow the user's language.
     Act toward actual deliverables and verify results. Before a consequential design choice, prepare 2–4 concrete alternatives with existing preview files where useful and call present_choices. Describe deliverables, office impact, and the next step. For routine reversible steps, continue autonomously within the user's request.
+    When a required non-sensitive fact or preference is missing, call ask_user with a focused question and explain why the answer matters. Suggested answers are optional; the user may type freely. Wait for the reply. If cancelled, do not guess or repeat the same question; explain what remains blocked or proceed with independent authorized work. An answer supplies information, not approval to write files or execute commands.
     Use the application's browser tool for isolated background web work, and desktop only for a user-authorized named app. Do not invoke AppleScript, osascript, global input synthesis, browser profile copying, or read another app's credentials to bypass these tools. Never request passwords, OTPs, or secret tokens via a tool. The user grants scoped control in the native UI and may stop at any time. Stop/denial is final for the action.
     Existing browser cookies are unavailable; request a next step if access requires login. Do not submit forms, send messages, spend money, or publish on behalf of the user without explicit authorization.
     Close the loop: perform the work, inspect outputs, run appropriate checks, then call complete_task with existing project-relative artifact paths, an honest summary, and specific verification evidence. A chat-only answer may supply no artifacts. The receipt records your evidence; it does not prove assertions. Do not claim tests or model runs that did not happen. If blocked, explain the exact missing input; do not manufacture completion.
@@ -885,6 +1018,7 @@ final class AppModel: ObservableObject {
         }
         let choice: [String: Any] = ["type": "object", "properties": ["id": string("Unique option ID"), "title": string("Option title"), "description": string("What this does"), "deliverables": array("Concrete expected deliverables"), "previewPaths": array("Existing files inside the project, never invented"), "impact": string("Impact on the user's ongoing office work"), "nextStep": string("What happens if selected")], "required": ["id", "title", "description", "deliverables", "previewPaths", "impact", "nextStep"], "additionalProperties": false]
         return [
+            tool("ask_user", "Ask for one necessary non-sensitive fact or preference in the native UI and wait for a free-text answer. Never ask for passwords, API keys, OTPs or other secrets. Cancellation is final for this question.", ["question": string("A focused question, maximum 2000 characters"), "context": string("Why the answer is needed and what happens next, maximum 8000 characters"), "options": ["type": "array", "items": ["type": "string"], "maxItems": 4, "description": "Optional suggested answers; free text is always allowed"], "placeholder": string("Optional hint for the answer")], ["question"]),
             tool("present_choices", "Present 2–4 inspectable alternatives in the native UI and wait for the user's choice.", ["title": string("Decision question"), "options": ["type": "array", "items": choice, "minItems": 2, "maxItems": 4]], ["title", "options"]),
             tool("browser", "Operate the app's isolated background browser after scoped native consent. Cannot use existing user cookies, submit forms, or cross origins without approval. read returns observed selectors; use them for click/fill.", ["action": ["type": "string", "enum": ["open", "read", "click", "fill", "screenshot"]], "url": string("HTTP(S) address for open"), "selector": string("Selector returned by read"), "text": string("Non-sensitive text for fill")], ["action"]),
             tool("desktop", "Use scoped macOS Accessibility control. list_apps; observe a bundleId; then press/setValue only an observed elementId. No global mouse/keyboard or activation. Writes wait for human idle; may fail if busy or permission absent.", ["action": ["type": "string", "enum": ["list_apps", "observe", "press", "setValue"]], "bundleId": string("Explicit target app bundle ID"), "elementId": string("Element ID from most recent observation"), "value": string("Non-sensitive value")], ["action"]),

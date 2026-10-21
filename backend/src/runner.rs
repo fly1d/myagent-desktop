@@ -254,7 +254,7 @@ async fn run_tool(
         item["path"] = arguments["path"].clone();
     }
     ctx.emit("item/started", json!({"item":item}))?;
-    let fingerprint = format!("{}:{}", call.name, serde_json::to_string(&arguments)?);
+    let fingerprint = action_fingerprint(workspace, &call.name, &arguments);
     let result = if denied.contains(&fingerprint) {
         Err(anyhow!("此操作已被用户拒绝，不得重试。"))
     } else {
@@ -289,6 +289,30 @@ async fn run_tool(
     }
     ctx.emit("item/completed", json!({"item":item}))?;
     result
+}
+
+fn action_fingerprint(workspace: &Workspace, name: &str, arguments: &Value) -> String {
+    // Compare the operation the execution tool will perform, rather than raw
+    // model JSON: ignored fields and equivalent paths must not reopen a denied
+    // approval. Native tools retain their own argument semantics unchanged.
+    let operation = match name {
+        "write_file" => arguments["path"]
+            .as_str()
+            .zip(arguments["content"].as_str())
+            .and_then(|(path, content)| {
+                workspace
+                    .path(path, true)
+                    .ok()
+                    .map(|path| json!({"path":path,"content":content}))
+            })
+            .unwrap_or_else(|| arguments.clone()),
+        "run_command" => arguments["command"]
+            .as_str()
+            .map(|command| json!({"cwd":workspace.root,"command":command}))
+            .unwrap_or_else(|| arguments.clone()),
+        _ => arguments.clone(),
+    };
+    format!("{name}:{operation}")
 }
 
 fn native_tool_result(reply: Value) -> Result<Value> {
@@ -823,11 +847,17 @@ mod tests {
     }
 
     async fn chat_fixture(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        chat_fixture_status(responses.into_iter().map(|body| ("200 OK", body)).collect()).await
+    }
+
+    async fn chat_fixture_status(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}/v1", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for response in responses {
+            for (status, response) in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -856,10 +886,11 @@ mod tests {
                         }
                     }
                 }
-                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len());
-                socket.write_all(header.as_bytes()).await.unwrap();
-                socket.write_all(response.as_bytes()).await.unwrap();
-                socket.shutdown().await.unwrap();
+                let header = format!("HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len());
+                if socket.write_all(header.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+                let _ = socket.shutdown().await;
             }
             requests
         });
@@ -871,6 +902,243 @@ mod tests {
             "data: {}\n\ndata: [DONE]\n\n",
             json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]})
         )
+    }
+
+    fn register_ask_user(ctx: &mut TurnContext) {
+        ctx.thread.dynamic_tools = vec![
+            json!({"name":"ask_user","description":"Ask a free-text question; never grants execution approval.","inputSchema":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}),
+        ];
+        ctx.state
+            .store
+            .lock()
+            .unwrap()
+            .update_thread(&ctx.thread)
+            .unwrap();
+    }
+
+    fn next_context(
+        state: Arc<State>,
+        old_turn: &str,
+        thread_id: &str,
+        status: &str,
+        provider: ProviderConfig,
+        input: &str,
+    ) -> TurnContext {
+        let turn_id = Uuid::new_v4().to_string();
+        let mut store = state.store.lock().unwrap();
+        store
+            .finish_turn(old_turn, status, Some("fixture previous turn ended"))
+            .unwrap();
+        let thread = store.thread(thread_id).unwrap();
+        let messages = store
+            .begin_turn(
+                thread_id,
+                &turn_id,
+                &json!({"role":"user","content":input}),
+                None,
+            )
+            .unwrap();
+        drop(store);
+        TurnContext {
+            state,
+            thread,
+            turn_id,
+            provider,
+            messages,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn native_answer(answer: &str) -> Value {
+        json!({"success":true,"contentItems":[{"type":"inputText","text":json!({"answer":answer,"cancelled":false}).to_string()}]})
+    }
+
+    #[tokio::test]
+    async fn http_failure_resumes_answer_history_but_free_text_accept_never_authorizes_write() {
+        let root = temporary();
+        let (mut ctx, mut events) = context(&root);
+        register_ask_user(&mut ctx);
+        let question = completion_fixture(
+            json!({"tool_calls":[{"index":0,"id":"question-a","type":"function","function":{"name":"ask_user","arguments":json!({"question":"输入文档名称"}).to_string()}}]}),
+            "tool_calls",
+        );
+        let write = completion_fixture(
+            json!({"tool_calls":[{"index":0,"id":"write-a","type":"function","function":{"name":"write_file","arguments":json!({"path":"deliverables/accept.txt","content":"not authorized by a free-text answer"}).to_string()}}]}),
+            "tool_calls",
+        );
+        let final_text = "本次写入未获批准，已停止。";
+        let (address, server) = chat_fixture_status(vec![
+            ("200 OK", question),
+            (
+                "500 Internal Server Error",
+                "fixture-secret-not-diagnostic".into(),
+            ),
+            ("200 OK", write),
+            (
+                "200 OK",
+                completion_fixture(json!({"content":final_text}), "stop"),
+            ),
+        ])
+        .await;
+        ctx.provider.base_url = address;
+        let user = json!({"role":"user","content":"fixture initial input"});
+        ctx.record_message(&user).unwrap();
+        ctx.messages = vec![user];
+        let state = ctx.state.clone();
+        let reviewer_state = state.clone();
+        let thread_id = ctx.thread.id.clone();
+        let old_turn = ctx.turn_id.clone();
+        let provider = ctx.provider.clone();
+        let reviewer = tokio::spawn(async move {
+            let mut question_count = 0;
+            let mut approval_count = 0;
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+            {
+                if event["method"] == "item/tool/call" {
+                    assert_eq!(event["params"]["tool"], "ask_user");
+                    question_count += 1;
+                    reviewer_state
+                        .receive_reply(json!({"id":event["id"],"result":native_answer("accept")}));
+                } else if event["method"] == "item/fileChange/requestApproval" {
+                    approval_count += 1;
+                    reviewer_state
+                        .receive_reply(json!({"id":event["id"],"result":{"decision":"decline"}}));
+                }
+                if event["method"] == "item/completed"
+                    && event["params"]["item"]["text"] == final_text
+                {
+                    break;
+                }
+            }
+            (question_count, approval_count)
+        });
+        let error = run_turn(ctx).await.unwrap_err();
+        assert!(error.to_string().contains("500"));
+        assert!(!error.to_string().contains("fixture-secret-not-diagnostic"));
+        let resumed = next_context(
+            state.clone(),
+            &old_turn,
+            &thread_id,
+            "failed",
+            provider,
+            "continue fixture",
+        );
+        tokio::time::timeout(Duration::from_secs(5), run_turn(resumed))
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(reviewer.await.unwrap(), (1, 1));
+        let restored = requests[2]["messages"].as_array().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|message| message["role"] == "user"
+                    && message["content"] == "fixture initial input")
+                .count(),
+            1
+        );
+        let result = restored
+            .iter()
+            .find(|message| message["tool_call_id"] == "question-a")
+            .unwrap();
+        let reply: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(reply, native_answer("accept"));
+        let denied: Value = serde_json::from_str(
+            requests[3]["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(denied["ok"], false);
+        assert!(denied["error"].as_str().unwrap().contains("用户拒绝"));
+        assert!(!root.join("deliverables").exists());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_ask_user_resumes_as_interrupted_without_replaying_or_accepting_late_answer() {
+        let root = temporary();
+        let (mut ctx, mut events) = context(&root);
+        register_ask_user(&mut ctx);
+        let question = completion_fixture(
+            json!({"tool_calls":[{"index":0,"id":"question-stopped","type":"function","function":{"name":"ask_user","arguments":json!({"question":"这个问题会被停止"}).to_string()}}]}),
+            "tool_calls",
+        );
+        let (address, server) = chat_fixture(vec![
+            question,
+            completion_fixture(
+                json!({"content":"从中断处继续，尚未收到问题答案。"}),
+                "stop",
+            ),
+        ])
+        .await;
+        ctx.provider.base_url = address;
+        let user = json!({"role":"user","content":"fixture initial question"});
+        ctx.record_message(&user).unwrap();
+        ctx.messages = vec![user];
+        let state = ctx.state.clone();
+        let token = ctx.cancel.clone();
+        let old_turn = ctx.turn_id.clone();
+        let thread_id = ctx.thread.id.clone();
+        let provider = ctx.provider.clone();
+        let running = tokio::spawn(run_turn(ctx));
+        let request = loop {
+            let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if event["method"] == "item/tool/call" {
+                break event;
+            }
+        };
+        assert_eq!(request["params"]["tool"], "ask_user");
+        token.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        state.receive_reply(json!({"id":request["id"],"result":native_answer("late accept must not become history")}));
+        let persisted = state.store.lock().unwrap().messages(&thread_id).unwrap();
+        assert_eq!(persisted.len(), 2);
+        let resumed = next_context(
+            state.clone(),
+            &old_turn,
+            &thread_id,
+            "interrupted",
+            provider,
+            "continue after stop",
+        );
+        tokio::time::timeout(Duration::from_secs(5), run_turn(resumed))
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = server.await.unwrap();
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let repaired = messages
+            .iter()
+            .find(|message| message["tool_call_id"] == "question-stopped")
+            .unwrap();
+        let result: Value = serde_json::from_str(repaired["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["ok"], false);
+        assert!(result["error"].as_str().unwrap().contains("interrupted"));
+        assert!(!messages.iter().any(|message| message
+            .to_string()
+            .contains("late accept must not become history")));
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                event["method"], "item/tool/call",
+                "The old question must not execute again during history repair"
+            );
+            assert_ne!(event["method"], "item/fileChange/requestApproval");
+        }
+        assert!(!root.join("deliverables").exists());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -992,6 +1260,72 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             assert_ne!(event["method"], "item/tool/call");
         }
+        drop(ctx);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn equivalent_refused_local_actions_do_not_prompt_again() {
+        let root = temporary();
+        let (ctx, mut events) = context(&root);
+        let state = ctx.state.clone();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let reviewer = tokio::spawn(async move {
+            let mut approvals = Vec::new();
+            loop {
+                let event = tokio::select! {
+                    _ = &mut stopped => break,
+                    event = events.recv() => event.unwrap(),
+                };
+                if event["method"] == "item/fileChange/requestApproval"
+                    || event["method"] == "item/commandExecution/requestApproval"
+                {
+                    state.receive_reply(json!({"id":event["id"],"result":{"decision":"decline"}}));
+                    approvals.push(event);
+                }
+            }
+            approvals
+        });
+        let workspace = Workspace::new(root.to_str().unwrap()).unwrap();
+        let mut denied = HashSet::new();
+        for (name, arguments) in [
+            (
+                "write_file",
+                json!({"path":"deliverables/refused.txt","content":"not approved"}),
+            ),
+            (
+                "write_file",
+                json!({"path":"deliverables//refused.txt","content":"not approved","ignored":true}),
+            ),
+            (
+                "run_command",
+                json!({"command":"printf refused > command-marker"}),
+            ),
+            (
+                "run_command",
+                json!({"command":"printf refused > command-marker","timeout_seconds":60,"ignored":true}),
+            ),
+        ] {
+            let call = ToolCall {
+                id: Uuid::new_v4().to_string(),
+                name: name.into(),
+                arguments: arguments.to_string(),
+            };
+            assert!(
+                run_tool(&ctx, &workspace, &HashSet::new(), &mut denied, &call)
+                    .await
+                    .is_err()
+            );
+        }
+        stop.send(()).unwrap();
+        let approvals = reviewer.await.unwrap();
+        assert_eq!(
+            approvals.len(),
+            2,
+            "One approval per distinct action, irrespective of ignored/default arguments"
+        );
+        assert!(!root.join("deliverables").exists());
+        assert!(!root.join("command-marker").exists());
         drop(ctx);
         fs::remove_dir_all(root).unwrap();
     }

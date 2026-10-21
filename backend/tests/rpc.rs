@@ -235,6 +235,112 @@ fn active_turn_interrupt_and_eof_do_not_wait_for_provider() {
 }
 
 #[test]
+fn pipelined_turn_start_and_interrupt_preserve_pipe_order() {
+    let home = home();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (stop_fixture, stopped) = mpsc::channel();
+    let fixture = std::thread::spawn(move || loop {
+        match stopped.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // A turn that reaches HTTP still receives a delayed tool call.
+                // Its cancelled request must never turn this into a UI approval
+                // or a file effect. A closed socket is expected after interrupt.
+                stream
+                    .set_write_timeout(Some(Duration::from_millis(300)))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                let body = format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"late-write","type":"function","function":{"name":"write_file","arguments":json!({"path":"late-marker.txt","content":"must never be written"}).to_string()}}]},"finish_reason":"tool_calls"}]})
+                );
+                let _ = write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                let _ = stream.flush();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("loopback fixture failed: {error}"),
+        }
+    });
+    let mut backend = Backend::start(&home);
+    assert_eq!(backend.call("provider/configure",json!({"provider":"custom","baseUrl":format!("http://{address}/v1"),"model":"fixture","apiKey":"fixture-only"}))["result"]["configured"],true);
+    let thread = backend.call("thread/start", json!({"cwd":home,"dynamicTools":[]}))["result"]
+        ["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut turns = Vec::new();
+    for index in 0..12 {
+        let turn = Uuid::new_v4().to_string();
+        let start_id = format!("pipelined-start-{index}");
+        let interrupt_id = format!("pipelined-interrupt-{index}");
+        let start = json!({"id":start_id,"method":"turn/start","params":{"threadId":thread,"clientTurnId":turn,"input":[{"type":"text","text":"stop this pipelined fixture immediately"}]}});
+        let interrupt = json!({"id":interrupt_id,"method":"turn/interrupt","params":{"threadId":thread,"turnId":turn}});
+        // One write and one flush: do not wait for the turn/start reply before
+        // sending interrupt. Waiting would hide the actual dispatch race.
+        let stdin = backend.child.stdin.as_mut().unwrap();
+        write!(stdin, "{start}\n{interrupt}\n").unwrap();
+        stdin.flush().unwrap();
+        let (mut start_replied, mut interrupt_replied, mut completed) = (false, false, false);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !(start_replied && interrupt_replied && completed) {
+            let message = backend
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("pipelined interrupt was lost before the turn became active");
+            assert!(
+                !(message.get("id").is_some()
+                    && message["method"]
+                        .as_str()
+                        .is_some_and(|method| method.starts_with("item/"))),
+                "cancelled turn requested a native tool: {message}"
+            );
+            if message["id"] == start_id {
+                assert_eq!(message["result"]["turn"]["id"], turn, "{message}");
+                start_replied = true;
+            } else if message["id"] == interrupt_id {
+                assert!(message.get("result").is_some(), "{message}");
+                interrupt_replied = true;
+            } else if message["method"] == "turn/completed"
+                && message["params"]["turn"]["id"] == turn
+            {
+                assert_eq!(message["params"]["turn"]["status"], "interrupted");
+                completed = true;
+            } else {
+                backend.events.push(message);
+            }
+        }
+        turns.push(turn);
+    }
+    stop_fixture.send(()).unwrap();
+    fixture.join().unwrap();
+    let resumed = backend.call("thread/resume", json!({"threadId":thread}));
+    for turn in turns {
+        let stored = resumed["result"]["thread"]["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stored| stored["id"] == turn)
+            .unwrap();
+        assert_eq!(stored["status"], "interrupted");
+    }
+    assert!(!backend
+        .events
+        .iter()
+        .any(|event| event["method"] == "item/started"
+            && event["params"]["item"]["type"] != "agentMessage"));
+    assert!(!home.join("late-marker.txt").exists());
+    backend.eof();
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn closing_stdout_stops_backend_even_when_stdin_remains_open() {
     let home = home();
     let mut child = Command::new(env!("CARGO_BIN_EXE_myagent-backend"))

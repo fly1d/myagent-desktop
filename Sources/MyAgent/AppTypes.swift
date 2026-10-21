@@ -34,6 +34,10 @@ struct AgentTask: Identifiable, Codable {
     var updatedAt = Date()
     var automaticRounds = 0
     var draft: String? = nil
+    // Kept until the backend acknowledges this exact input. The turn ID lets
+    // recovery distinguish an unsubmitted prompt from a lost RPC reply.
+    var pendingInput: String? = nil
+    var pendingTurnID: String? = nil
 }
 
 struct ArtifactItem: Identifiable, Hashable {
@@ -66,6 +70,14 @@ struct PendingChoice: Identifiable {
     var id = UUID()
     var title: String
     var options: [ChoiceCard]
+}
+
+struct PendingQuestion: Identifiable {
+    var id = UUID()
+    var question: String
+    var context: String = ""
+    var options: [String] = []
+    var placeholder: String = "输入你的回答…"
 }
 
 struct PendingPermission: Identifiable {

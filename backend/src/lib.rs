@@ -300,6 +300,12 @@ pub async fn dispatch(state: Arc<State>, method: &str, params: Value) -> Result<
             if let Some(instructions) = params["developerInstructions"].as_str() {
                 thread.developer_instructions = instructions.into();
             }
+            if let Some(tools) = params.get("dynamicTools") {
+                thread.dynamic_tools = tools
+                    .as_array()
+                    .context("dynamicTools must be an array")?
+                    .clone();
+            }
             state.store.lock().unwrap().update_thread(&thread)?;
             thread_response(&state, &thread)
         }
@@ -365,7 +371,12 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
     if text.trim().is_empty() {
         bail!("A nonempty text input is required");
     }
-    let turn_id = Uuid::new_v4().to_string();
+    let turn_id = match params.get("clientTurnId") {
+        Some(value) => Uuid::parse_str(value.as_str().context("clientTurnId must be a UUID")?)
+            .context("clientTurnId must be a UUID")?
+            .to_string(),
+        None => Uuid::new_v4().to_string(),
+    };
     let cancel = CancellationToken::new();
     {
         let mut active = state.active.lock().unwrap();
@@ -395,11 +406,8 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
     let messages = match prepared {
         Ok(m) => m,
         Err(error) => {
-            let _ = state.store.lock().unwrap().finish_turn(
-                &turn_id,
-                "failed",
-                Some("Unable to prepare turn history"),
-            );
+            // begin_turn is atomic. A conflicting client ID must not mutate
+            // the previously committed turn that owns that ID.
             state.active.lock().unwrap().remove(thread_id);
             return Err(error);
         }
@@ -548,6 +556,67 @@ mod tests {
             state.store.lock().unwrap().turns(&thread.id)?[0]["status"],
             "failed"
         );
+        drop(state);
+        std::fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_refreshes_native_tools_and_duplicate_client_id_preserves_history() -> Result<()>
+    {
+        let home = std::env::temp_dir().join(format!("myagent-resume-tools-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home)?;
+        let mut store = Store::open(&home.join("test.sqlite"))?;
+        let thread = store.create_thread(home.display().to_string(), "old".into(), vec![], None)?;
+        let submitted = Uuid::new_v4().to_string();
+        store.begin_turn(
+            &thread.id,
+            &submitted,
+            &json!({"role":"user","content":"original"}),
+            None,
+        )?;
+        store.finish_turn(&submitted, "completed", None)?;
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let state = Arc::new(State::new(store, sender));
+        *state.provider.lock().unwrap() = Some(ProviderConfig {
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1/v1".into(),
+            model: "fixture".into(),
+            api_key: None,
+        });
+        let tools = json!([{"type":"function","name":"ask_user","inputSchema":{"type":"object"}}]);
+        let restored = dispatch(
+            state.clone(),
+            "thread/resume",
+            json!({
+                "threadId":thread.id, "developerInstructions":"current", "dynamicTools":tools
+            }),
+        )
+        .await?;
+        assert_eq!(restored["thread"]["turns"][0]["id"], submitted);
+        let updated = state.store.lock().unwrap().thread(&thread.id)?;
+        assert_eq!(updated.developer_instructions, "current");
+        assert_eq!(updated.dynamic_tools, tools.as_array().unwrap().clone());
+        assert!(dispatch(
+            state.clone(),
+            "turn/start",
+            json!({
+                "threadId":thread.id, "clientTurnId":submitted,
+                "input":[{"type":"text","text":"must not be duplicated"}]
+            })
+        )
+        .await
+        .is_err());
+        assert!(state.active.lock().unwrap().is_empty());
+        assert_eq!(
+            state.store.lock().unwrap().turns(&thread.id)?[0]["status"],
+            "completed"
+        );
+        assert_eq!(state.store.lock().unwrap().messages(&thread.id)?.len(), 1);
+        assert!(dispatch(state.clone(), "turn/start", json!({
+            "threadId":thread.id, "clientTurnId":"invalid", "input":[{"type":"text","text":"invalid"}]
+        })).await.is_err());
+        assert_eq!(state.store.lock().unwrap().turns(&thread.id)?.len(), 1);
         drop(state);
         std::fs::remove_dir_all(home)?;
         Ok(())
