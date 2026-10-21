@@ -128,7 +128,7 @@ final class AgentConnection {
         }
         do {
             _ = try await call("initialize", params: [
-                "clientInfo": ["name": "myagent_desktop", "title": "MyAgent", "version": "0.1.0"],
+                "clientInfo": ["name": "myagent_desktop", "title": "MyAgent", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"],
                 "capabilities": ["experimentalApi": true]
             ])
             guard generation == token else { throw CancellationError() }

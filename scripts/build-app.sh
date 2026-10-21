@@ -13,6 +13,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 cargo build --manifest-path "$PROJECT_DIR/backend/Cargo.toml" --release --locked
+APP_VERSION="$(cargo metadata --manifest-path "$PROJECT_DIR/backend/Cargo.toml" --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 
 swift build --package-path "$PROJECT_DIR" --configuration release
 BIN_DIR="$(swift build --package-path "$PROJECT_DIR" --configuration release --show-bin-path)"
@@ -26,7 +27,7 @@ cp "$PROJECT_DIR/backend/target/release/myagent-backend" "$APP_DIR/Contents/Reso
 cp "$PROJECT_DIR/LICENSE" "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$APP_DIR/Contents/Resources/licenses/"
 python3 "$SCRIPT_DIR/collect-licenses.py" "$APP_DIR/Contents/Resources/licenses/rust"
 
-cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -36,8 +37,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>MyAgent</string>
   <key>CFBundleDisplayName</key><string>MyAgent</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+  <key>CFBundleVersion</key><string>$APP_VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>

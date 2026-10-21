@@ -115,6 +115,8 @@ final class AppModel: ObservableObject {
     func connect() async {
         guard !isConnected, !connecting else { return }
         connecting = true
+        let initialSelection = selectedTaskID
+        let initialDraft = draft
         connectionLabel = "正在启动本地后端"
         defer { connecting = false }
         do {
@@ -138,15 +140,22 @@ final class AppModel: ObservableObject {
                 if let object = stored["state"] as? [String: Any], JSONSerialization.isValidJSONObject(object) {
                     let data = try JSONSerialization.data(withJSONObject: object)
                     if let state = try? JSONDecoder().decode(PersistedAppState.self, from: data) {
-                        tasks = state.tasks.map { task in
+                        let recovered = state.tasks.map { task in
                             var recovered = task
                             if [.running, .connecting, .waiting].contains(task.phase) { recovered.phase = .paused }
                             return recovered
                         }
-                        settings = state.settings
-                        selectedTaskID = state.selectedTaskID
-                        if let provider = state.provider { providerDraft = provider; savedProvider = provider }
-                        draft = tasks.first(where: { $0.id == selectedTaskID })?.draft ?? state.unassignedDraft ?? ""
+                        if selectedTaskID == initialSelection && draft == initialDraft {
+                            tasks = recovered
+                            settings = state.settings
+                            selectedTaskID = state.selectedTaskID
+                            if let provider = state.provider { providerDraft = provider; savedProvider = provider }
+                            draft = tasks.first(where: { $0.id == selectedTaskID })?.draft ?? state.unassignedDraft ?? ""
+                        } else {
+                            // Loading the backend must not replace text already typed during startup.
+                            let localIDs = Set(tasks.map(\.id))
+                            tasks.append(contentsOf: recovered.filter { !localIDs.contains($0.id) })
+                        }
                     }
                 }
                 if let key = try SecureStore.read(credentialAccount(savedProvider)) {

@@ -11,7 +11,11 @@ struct AppModelTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let first = AppModel(dataDirectory: root)
         first.draft = "保留未发送的第一条输入"
-        try await Task.sleep(nanoseconds: 500_000_000)
+        try await eventually("the debounced first draft is durably written") {
+            guard let data = try? Data(contentsOf: root.appendingPathComponent("state.json")),
+                  let state = try? JSONDecoder().decode(PersistedAppState.self, from: data) else { return false }
+            return state.unassignedDraft == "保留未发送的第一条输入"
+        }
         let restored = AppModel(dataDirectory: root)
         #expect(restored.draft == "保留未发送的第一条输入")
         #expect(restored.tasks.isEmpty)
