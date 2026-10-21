@@ -4,6 +4,7 @@ import Testing
 
 /// The production Swift controller and Rust binary communicate with an isolated
 /// HTTP model fixture. Only the remote model is simulated; tools and storage are real.
+@Suite(.serialized)
 @MainActor
 struct BackendEndToEndTests {
     @Test(.timeLimit(.minutes(1)))
@@ -325,6 +326,7 @@ private final class HTTPModelFixture {
     static let key = "myagent-e2e-fixture-key-not-a-real-credential"
     let directory: URL
     let process = Process()
+    private var diagnosticHandle: FileHandle?
     var address = ""
     var data: URL { directory.appendingPathComponent("data") }
     var report: URL { data.appendingPathComponent("Workspace/deliverables/report.txt") }
@@ -358,21 +360,60 @@ private final class HTTPModelFixture {
         process.arguments = [script.path, directory.path]
         process.environment = ["PATH": "/usr/bin:/bin"]
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
+        let diagnostics = directory.appendingPathComponent("fixture-stderr.log")
+        guard FileManager.default.createFile(atPath: diagnostics.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw AppFailure.message("Unable to create isolated HTTP fixture diagnostics")
+        }
+        diagnosticHandle = try FileHandle(forWritingTo: diagnostics)
+        process.standardError = diagnosticHandle
+        do { try process.run() }
+        catch {
+            try? diagnosticHandle?.close()
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 
     static func start() async throws -> HTTPModelFixture {
         let fixture = try HTTPModelFixture()
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = ProcessInfo.processInfo.systemUptime + 20
         while true {
-            if let text = try? String(contentsOf: fixture.directory.appendingPathComponent("address.txt"), encoding: .utf8) {
+            guard fixture.process.isRunning else {
+                let failure = fixture.startupFailure("exited before readiness (status \(fixture.process.terminationStatus))")
+                fixture.stop()
+                throw failure
+            }
+            if let text = try? String(contentsOf: fixture.directory.appendingPathComponent("address.txt"), encoding: .utf8),
+               let address = URL(string: text), address.scheme == "http", address.host == "127.0.0.1",
+               address.port != nil, address.path == "/v1" {
                 fixture.address = text
                 return fixture
             }
-            guard Date() < deadline, fixture.process.isRunning else { fixture.stop(); throw AppFailure.message("HTTP model fixture did not start") }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                let failure = fixture.startupFailure("readiness handshake timed out after 20 seconds while the process was still running")
+                fixture.stop()
+                throw failure
+            }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
+    }
+
+    private func startupFailure(_ reason: String) -> AppFailure {
+        // This file belongs exclusively to the environment-cleared Python
+        // fixture. Never read application, provider, or Keychain diagnostics.
+        let file = directory.appendingPathComponent("fixture-stderr.log")
+        var diagnostic = "No fixture stderr was captured."
+        if let reader = try? FileHandle(forReadingFrom: file) {
+            defer { try? reader.close() }
+            if let size = try? reader.seekToEnd() {
+                try? reader.seek(toOffset: size > 4_096 ? size - 4_096 : 0)
+                if let bytes = try? reader.read(upToCount: 4_096), !bytes.isEmpty {
+                    diagnostic = String(decoding: bytes, as: UTF8.self)
+                        .replacingOccurrences(of: Self.key, with: "[fixture key redacted]")
+                }
+            }
+        }
+        return AppFailure.message("HTTP model fixture \(reason).\nFixture stderr (last 4 KB):\n\(diagnostic)")
     }
 
     func makeModel(_ secrets: MemoryCredentialStore) -> AppModel {
@@ -388,6 +429,8 @@ private final class HTTPModelFixture {
 
     func stop() {
         if process.isRunning { process.terminate(); process.waitUntilExit() }
+        try? diagnosticHandle?.close()
+        diagnosticHandle = nil
         try? FileManager.default.removeItem(at: directory)
     }
 
