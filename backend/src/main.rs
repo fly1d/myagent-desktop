@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use myagent_backend::{dispatch, store::Store, State};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,37 +21,73 @@ async fn main() -> Result<()> {
     let store = Store::open(&home.join("myagent.sqlite"))?;
     let (sender, mut receiver) = mpsc::unbounded_channel::<Value>();
     let state = Arc::new(State::new(store, sender));
-    let writer = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(message) = receiver.recv().await {
-            let mut bytes = serde_json::to_vec(&message)?;
+    let disconnected = CancellationToken::new();
+    let output_disconnected = disconnected.clone();
+    // Dedicated OS threads keep a blocked pipe from holding Tokio's runtime
+    // shutdown open after the other pipe has disconnected.
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        while let Some(message) = receiver.blocking_recv() {
+            let Ok(mut bytes) = serde_json::to_vec(&message) else {
+                output_disconnected.cancel();
+                return;
+            };
             bytes.push(b'\n');
-            stdout.write_all(&bytes).await?;
-            stdout.flush().await?;
+            if stdout
+                .write_all(&bytes)
+                .and_then(|_| stdout.flush())
+                .is_err()
+            {
+                output_disconnected.cancel();
+                return;
+            }
         }
-        Ok::<(), anyhow::Error>(())
     });
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut buffer = Vec::new();
+    let (input_sender, mut input_receiver) = mpsc::channel(32);
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Read};
+        let stdin = std::io::stdin();
+        let mut stdin = std::io::BufReader::new(stdin.lock());
+        loop {
+            let mut buffer = Vec::new();
+            let result = (&mut stdin)
+                .take(8 * 1024 * 1024 + 1)
+                .read_until(b'\n', &mut buffer);
+            match result {
+                Ok(0) => break,
+                Ok(_) if buffer.len() <= 8 * 1024 * 1024 => {
+                    if input_sender.blocking_send(Ok(buffer)).is_err() {
+                        break;
+                    }
+                }
+                _ => {
+                    let _ = input_sender.blocking_send(Err(()));
+                    break;
+                }
+            }
+        }
+    });
     let mut initialized = false;
     loop {
-        buffer.clear();
-        // read_until alone has no frame bound: cap the underlying reader per frame.
-        use tokio::io::AsyncReadExt;
-        let count = (&mut stdin)
-            .take(8 * 1024 * 1024 + 1)
-            .read_until(b'\n', &mut buffer)
-            .await?;
-        if count == 0 {
+        let frame = tokio::select! {
+            biased;
+            _=disconnected.cancelled()=>break,
+            frame=input_receiver.recv()=>frame,
+        };
+        let Some(Ok(buffer)) = frame else {
             break;
-        }
-        if buffer.len() > 8 * 1024 * 1024 {
-            break;
-        }
+        };
         let message: Value = match serde_json::from_slice(&buffer) {
             Ok(m) => m,
             Err(_) => {
-                state.send(json!({"id":null,"error":{"code":-32700,"message":"Invalid JSON"}}))?;
+                if state
+                    .send(json!({"id":null,"error":{"code":-32700,"message":"Invalid JSON"}}))
+                    .is_err()
+                {
+                    break;
+                }
                 continue;
             }
         };
@@ -67,14 +103,22 @@ async fn main() -> Result<()> {
         };
         if method == "initialize" {
             if initialized {
-                state.send(
-                    json!({"id":id,"error":{"code":-32600,"message":"Already initialized"}}),
-                )?;
+                if state
+                    .send(json!({"id":id,"error":{"code":-32600,"message":"Already initialized"}}))
+                    .is_err()
+                {
+                    break;
+                }
                 continue;
             }
             initialized = true;
         } else if !initialized {
-            state.send(json!({"id":id,"error":{"code":-32600,"message":"Not initialized"}}))?;
+            if state
+                .send(json!({"id":id,"error":{"code":-32600,"message":"Not initialized"}}))
+                .is_err()
+            {
+                break;
+            }
             continue;
         }
         let method = method.to_owned();
@@ -90,9 +134,16 @@ async fn main() -> Result<()> {
         });
     }
     state.cancel_all();
-    // A brief cancellation window lets running tools kill their child processes.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Let cancellation finalize durable status and terminate command children.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state.active.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     drop(state);
-    writer.abort();
     Ok(())
 }

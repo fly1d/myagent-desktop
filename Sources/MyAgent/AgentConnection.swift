@@ -23,6 +23,7 @@ final class AgentConnection {
     private static let maximumFrameBytes = 8 * 1_024 * 1_024
     private static let requestTimeout: UInt64 = 60_000_000_000
     private var process: Process?
+    private var retiringProcesses: [Process] = []
     private var input: FileHandle?
     private var output: FileHandle?
     private var diagnostics: FileHandle?
@@ -37,6 +38,32 @@ final class AgentConnection {
 
     func launch(binary: URL, home: URL) async throws {
         stop()
+        try await waitForRetiredProcesses()
+        try await startProcess(binary: binary, home: home)
+    }
+
+    func stopAndWait() async throws {
+        stop()
+        try await waitForRetiredProcesses()
+    }
+
+    private func waitForRetiredProcesses() async throws {
+        // The backend holds an exclusive database lock until its process exits.
+        // Reconnect must not race a previously terminated process for that lock.
+        let gracefulDeadline = Date().addingTimeInterval(2)
+        let hardDeadline = Date().addingTimeInterval(3)
+        while retiringProcesses.contains(where: { $0.isRunning }) {
+            try Task.checkCancellation()
+            if Date() > gracefulDeadline {
+                for child in retiringProcesses where child.isRunning { kill(child.processIdentifier, SIGKILL) }
+            }
+            guard Date() < hardDeadline else { throw ConnectionError.message("旧后端未能退出，请稍后重试。") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        retiringProcesses.removeAll()
+    }
+
+    private func startProcess(binary: URL, home: URL) async throws {
         guard binary.isFileURL, FileManager.default.isExecutableFile(atPath: binary.path) else {
             throw ConnectionError.message("应用内的 Agent 运行时不存在或无法执行。")
         }
@@ -278,7 +305,7 @@ final class AgentConnection {
         input = nil
         output = nil
         diagnostics = nil
-        if child?.isRunning == true { child?.terminate() }
+        if let child, child.isRunning { retiringProcesses.append(child); child.terminate() }
         receiveBuffer.removeAll(keepingCapacity: false)
         let waiting = pending
         pending.removeAll()

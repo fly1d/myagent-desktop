@@ -145,10 +145,22 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Debug)]
 pub struct Completion {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    // Provider protocol state, never a user-facing message or delta. DeepSeek
+    // requires it to be replayed across thinking-mode tool requests.
+    pub reasoning_content: Option<String>,
+}
+
+impl fmt::Debug for Completion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Completion")
+            .field("content_bytes", &self.content.len())
+            .field("tool_count", &self.tool_calls.len())
+            .field("has_reasoning_state", &self.reasoning_content.is_some())
+            .finish()
+    }
 }
 
 impl Provider {
@@ -247,10 +259,12 @@ impl Provider {
         cancel: &CancellationToken,
         deltas: mpsc::Sender<String>,
     ) -> Result<Completion, ProviderError> {
+        let messages = self.prepare_messages(messages);
         let mut body = json!({"model":self.config.model,"messages":messages,"stream":true});
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
-            body["tool_choice"] = json!("auto");
+            // `auto` is the API default when tools are present. Omitting this
+            // redundant parameter also accommodates thinking-mode endpoints.
         }
         if serde_json::to_vec(&body)
             .map_err(|_| ProviderError::Protocol("模型请求无法编码。"))?
@@ -285,6 +299,9 @@ impl Provider {
                 return Err(ProviderError::Limit("模型流式响应超过 8 MB 限制。"));
             }
             for frame in parser.push(&bytes)? {
+                if cancel.is_cancelled() {
+                    return Err(ProviderError::Cancelled);
+                }
                 let outcome = state.consume(&frame)?;
                 if let Some(text) = outcome.text {
                     tokio::select! {
@@ -300,26 +317,41 @@ impl Provider {
             }
         }
         if !finished {
-            for frame in parser.finish()? {
-                let outcome = state.consume(&frame)?;
-                if let Some(text) = outcome.text {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                        sent = deltas.send(text) => sent.map_err(|_| ProviderError::Cancelled)?,
-                    }
-                }
-                if outcome.done {
-                    finished = true;
-                }
-            }
-        }
-        if !finished && state.finish_reason.is_none() {
+            parser.finish()?;
             return Err(ProviderError::Protocol(
-                "模型连接提前关闭，未收到完成标记。",
+                "模型连接提前关闭，未收到完整的 [DONE] 完成标记；本轮未完成。",
             ));
         }
         state.finish()
+    }
+
+    fn prepare_messages(&self, mut messages: Vec<Value>) -> Vec<Value> {
+        let deepseek = self.config.provider.eq_ignore_ascii_case("deepseek")
+            || Url::parse(&self.config.base_url)
+                .ok()
+                .is_some_and(|url| url.host_str() == Some("api.deepseek.com"));
+        for message in &mut messages {
+            if message["role"] != "assistant" {
+                continue;
+            }
+            if let Some(fields) = message.as_object_mut() {
+                if deepseek {
+                    // Empty state represents an older/non-thinking message;
+                    // actual returned reasoning is preserved without changes.
+                    fields
+                        .entry("reasoning_content")
+                        .or_insert_with(|| json!(""));
+                    if fields.get("content").is_none_or(Value::is_null) {
+                        fields.insert("content".into(), json!(""));
+                    }
+                } else {
+                    // Switching a thread to OpenAI must not send DeepSeek-only
+                    // message extensions to a stricter API.
+                    fields.remove("reasoning_content");
+                }
+            }
+        }
+        messages
     }
 }
 
@@ -398,21 +430,22 @@ impl SseParser {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<Vec<u8>>, ProviderError> {
-        let mut frames = Vec::new();
-        if !self.line.is_empty() {
-            self.consume_line(&mut frames)?;
+    fn finish(&self) -> Result<(), ProviderError> {
+        // SSE dispatches an event only at its terminating blank line. EOF must
+        // never promote a partial line or undelimited [DONE] into completion.
+        if !self.line.is_empty() || !self.event.is_empty() {
+            return Err(ProviderError::Protocol(
+                "模型 SSE 连接在事件结束之前中断，本轮未完成。",
+            ));
         }
-        if !self.event.is_empty() {
-            frames.push(std::mem::take(&mut self.event));
-        }
-        Ok(frames)
+        Ok(())
     }
 }
 
 #[derive(Default)]
 struct CompletionState {
     content: String,
+    reasoning_content: Option<String>,
     calls: BTreeMap<usize, ToolCall>,
     finish_reason: Option<String>,
     frames: usize,
@@ -437,25 +470,49 @@ impl CompletionState {
         }
         let value: Value = serde_json::from_slice(frame)
             .map_err(|_| ProviderError::Protocol("模型流式事件不是有效 UTF-8 JSON。"))?;
-        if value.get("error").is_some() {
+        if value.get("error").is_some_and(|error| !error.is_null()) {
             return Err(ProviderError::Protocol(
                 "模型服务在流式响应中返回错误；未显示服务商原始内容以保护密钥。",
             ));
         }
-        let Some(choice) = value
+        let choices = value
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-        else {
+            .ok_or(ProviderError::Protocol("模型流式事件缺少 choices 数组。"))?;
+        let Some(choice) = choices.first() else {
             return Ok(FrameOutcome {
                 text: None,
                 done: false,
             });
         };
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            self.finish_reason = Some(reason.to_owned());
+        if choice
+            .get("index")
+            .is_some_and(|index| index.as_u64() != Some(0))
+        {
+            return Err(ProviderError::Protocol("模型返回了未请求的多选响应。"));
         }
         let delta = &choice["delta"];
+        let has_output = ["content", "reasoning_content"]
+            .iter()
+            .any(|field| delta[*field].as_str().is_some_and(|text| !text.is_empty()))
+            || delta["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty());
+        if self.finish_reason.is_some() && has_output {
+            return Err(ProviderError::Protocol(
+                "模型在完成标记之后继续生成输出，本轮未完成。",
+            ));
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if self
+                .finish_reason
+                .as_deref()
+                .is_some_and(|previous| previous != reason)
+            {
+                return Err(ProviderError::Protocol("模型返回互相矛盾的完成原因。"));
+            }
+            self.finish_reason = Some(reason.to_owned());
+        }
         let text = delta
             .get("content")
             .and_then(Value::as_str)
@@ -467,6 +524,13 @@ impl CompletionState {
             }
             self.content.push_str(text);
         }
+        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+            let retained = self.reasoning_content.get_or_insert_with(String::new);
+            if retained.len() + reasoning.len() > MAX_TEXT_BYTES {
+                return Err(ProviderError::Limit("模型协议推理状态超过 1 MB 限制。"));
+            }
+            retained.push_str(reasoning);
+        }
         if delta
             .get("refusal")
             .and_then(Value::as_str)
@@ -476,6 +540,13 @@ impl CompletionState {
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
+                if call
+                    .get("type")
+                    .filter(|kind| !kind.is_null())
+                    .is_some_and(|kind| kind != "function")
+                {
+                    return Err(ProviderError::Protocol("模型返回不支持的工具调用类型。"));
+                }
                 let index = call
                     .get("index")
                     .and_then(Value::as_u64)
@@ -517,10 +588,20 @@ impl CompletionState {
                     "模型输出受到内容过滤，本轮未完成。",
                 ))
             }
-            Some("stop" | "tool_calls") | None => {}
+            Some("stop" | "tool_calls") => {}
+            None => {
+                return Err(ProviderError::Protocol(
+                    "模型缺少明确的 finish_reason，本轮未完成。",
+                ))
+            }
             Some(_) => return Err(ProviderError::Protocol("模型返回不支持的完成原因。")),
         }
         let calls: Vec<ToolCall> = self.calls.into_values().collect();
+        if (self.finish_reason.as_deref() == Some("tool_calls")) != !calls.is_empty() {
+            return Err(ProviderError::Protocol(
+                "模型完成原因与工具调用内容不一致，本轮未完成。",
+            ));
+        }
         let mut ids = std::collections::HashSet::new();
         for call in &calls {
             if call.id.is_empty()
@@ -542,6 +623,7 @@ impl CompletionState {
         Ok(Completion {
             content: self.content,
             tool_calls: calls,
+            reasoning_content: self.reasoning_content,
         })
     }
 }
@@ -606,8 +688,89 @@ mod tests {
             .push(&vec![b'x'; MAX_EVENT_BYTES + 1])
             .is_err());
         let mut state = CompletionState::default();
-        state.consume(br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{}"}}]}}]}"#).unwrap();
-        assert!(state.finish().is_err());
+        state.consume(br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#).unwrap();
+        assert!(state.finish().unwrap_err().to_string().contains("唯一"));
+    }
+
+    #[test]
+    fn compatible_null_tool_metadata_preserves_argument_fragments() {
+        let mut state = CompletionState::default();
+        state.consume(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\""}}]}}]}).to_string().as_bytes()).unwrap();
+        state.consume(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":null,"arguments":"README.md\"}"}}]},"finish_reason":"tool_calls"}]}).to_string().as_bytes()).unwrap();
+        let completion = state.finish().unwrap();
+        assert_eq!(completion.tool_calls[0].name, "read_file");
+        assert_eq!(completion.tool_calls[0].id, "call-a");
+        assert_eq!(
+            completion.tool_calls[0].arguments,
+            "{\"path\":\"README.md\"}"
+        );
+        let mut invalid = CompletionState::default();
+        assert!(invalid
+            .consume(
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"type":"unsupported"}]}}]})
+                    .to_string()
+                    .as_bytes()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn tool_finish_reason_must_match_actual_calls() {
+        for (reason, calls) in [("stop", true), ("tool_calls", false)] {
+            let mut state = CompletionState::default();
+            let delta = if calls {
+                json!({"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"read_file","arguments":"{}"}}]})
+            } else {
+                json!({"content":"partial"})
+            };
+            state
+                .consume(
+                    json!({"choices":[{"delta":delta,"finish_reason":reason}]})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            assert!(state.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn reasoning_state_is_replayed_only_to_deepseek_and_never_displayed_as_text() {
+        let mut state = CompletionState::default();
+        for part in ["协议", "状态"] {
+            let outcome = state
+                .consume(
+                    json!({"choices":[{"delta":{"reasoning_content":part}}]})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            assert!(outcome.text.is_none());
+        }
+        state
+            .consume(
+                json!({"choices":[{"delta":{"content":"公开回答"},"finish_reason":"stop"}]})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let completion = state.finish().unwrap();
+        assert_eq!(completion.reasoning_content.as_deref(), Some("协议状态"));
+        assert_eq!(completion.content, "公开回答");
+        assert!(!format!("{completion:?}").contains("协议状态"));
+        let history =
+            vec![json!({"role":"assistant","content":null,"reasoning_content":"协议状态"})];
+        let mut config = fixture_config("http://127.0.0.1:1/v1".into());
+        config.provider = "deepseek".into();
+        let prepared = Provider::new(config)
+            .unwrap()
+            .prepare_messages(history.clone());
+        assert_eq!(prepared[0]["reasoning_content"], "协议状态");
+        assert_eq!(prepared[0]["content"], "");
+        let openai = Provider::new(fixture_config("http://127.0.0.1:1/v1".into()))
+            .unwrap()
+            .prepare_messages(history);
+        assert!(openai[0].get("reasoning_content").is_none());
     }
 
     async fn http_fixture(
@@ -646,11 +809,14 @@ mod tests {
                 }
             }
             let header = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",body.len());
-            socket.write_all(header.as_bytes()).await.unwrap();
-            for bytes in body.as_bytes().chunks(3) {
-                socket.write_all(bytes).await.unwrap();
+            if socket.write_all(header.as_bytes()).await.is_ok() {
+                for bytes in body.as_bytes().chunks(3) {
+                    if socket.write_all(bytes).await.is_err() {
+                        break;
+                    }
+                }
             }
-            socket.shutdown().await.unwrap();
+            let _ = socket.shutdown().await;
             String::from_utf8(request).unwrap()
         });
         (address, task)
@@ -745,6 +911,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_http_rejects_incomplete_streams_and_error_frames() {
+        let text = json!({"choices":[{"delta":{"content":"仅收到部分回答"},"finish_reason":null}]});
+        let terminal = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+        let bodies = [
+            // Clean HTTP EOF is not proof that model generation completed.
+            format!("data: {text}\n\n"),
+            format!("data: {text}\n\ndata: {terminal}\n\n"),
+            format!("data: {text}\n\ndata: [DONE]\n\n"),
+            format!("data: {text}\n\ndata: {terminal}\n\ndata: [DONE]"),
+            format!("data: {text}\n\ndata: {{\"error\":{{\"message\":\"fixture-only-secret\"}}}}\n\ndata: [DONE]\n\n"),
+            format!("data: {text}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{},"finish_reason":"length"}]})),
+        ];
+        for body in bodies {
+            let (address, server) = http_fixture("200 OK", "", body).await;
+            let provider = Provider::new(fixture_config(address)).unwrap();
+            let (sender, _receiver) = mpsc::channel(32);
+            let result = provider
+                .complete(
+                    vec![json!({"role":"user","content":"test"})],
+                    vec![],
+                    &CancellationToken::new(),
+                    sender,
+                )
+                .await;
+            let error = result.unwrap_err();
+            assert!(!error.to_string().contains("fixture-only-secret"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_drops_pending_http_request() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -758,6 +955,48 @@ mod tests {
         let token = cancel.clone();
         let request = tokio::spawn(async move { provider.models(&token).await });
         tokio::time::sleep(Duration::from_millis(75)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(ProviderError::Cancelled)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_an_active_partial_sse_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {}\n\n",json!({"choices":[{"delta":{"content":"正在生成"},"finish_reason":null}]}));
+            socket.write_all(response.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let provider = Provider::new(fixture_config(address)).unwrap();
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let (sender, mut receiver) = mpsc::channel(32);
+        let request = tokio::spawn(async move {
+            provider
+                .complete(
+                    vec![json!({"role":"user","content":"test cancellation"})],
+                    vec![],
+                    &token,
+                    sender,
+                )
+                .await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "正在生成"
+        );
         cancel.cancel();
         let result = tokio::time::timeout(Duration::from_secs(2), request)
             .await

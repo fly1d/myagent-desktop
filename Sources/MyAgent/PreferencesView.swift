@@ -20,12 +20,19 @@ struct PreferencesView: View {
                 Divider().padding(.horizontal, 20)
                 VStack(alignment: .leading, spacing: 13) {
                     Text("本地后端").font(.system(size: 12, weight: .semibold))
-                    Text(model.connectionLabel).font(.system(size: 12)).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        if model.isConnecting { ProgressView().controlSize(.small) }
+                        Text(model.connectionLabel).font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
                     HStack {
-                        Button("重新连接后端") { Task { await model.reconnect() } }.disabled(model.isBusy)
+                        Button(model.isConnecting ? "正在启动…" : "重新连接后端") {
+                            model.clearError()
+                            Task { await model.reconnect() }
+                        }.disabled(model.isBusy || model.isTestingConnection || model.isConnecting)
                         Spacer()
                         if model.hasCredentials {
-                            Button("断开模型连接", action: model.disconnectProvider).disabled(model.isBusy)
+                            Button("断开模型连接", action: model.disconnectProvider)
+                                .disabled(model.isBusy || model.isTestingConnection || model.isConnecting)
                         }
                     }
                 }.padding(20)

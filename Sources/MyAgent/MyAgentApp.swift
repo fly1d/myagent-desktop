@@ -8,6 +8,7 @@ struct MyAgentApp: App {
             WorkspaceView(model: model)
                 .frame(minWidth: 1000, minHeight: 680)
                 .task { await model.connect() }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in model.shutdown() }
         }
         .defaultSize(width: 1380, height: 900)
         .commands {

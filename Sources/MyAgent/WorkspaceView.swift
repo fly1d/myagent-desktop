@@ -8,6 +8,7 @@ struct WorkspaceView: View {
     @State private var search = ""
     @State private var inputHeight: CGFloat = 60
     @State private var followsLatest = true
+    @State private var userIsScrolling = false
     @State private var activeSheet: WorkspaceSheet?
 
     private var colorScheme: ColorScheme? {
@@ -19,6 +20,18 @@ struct WorkspaceView: View {
         return [.connecting, .running, .waiting].contains(phase)
     }
     private var projectName: String { URL(fileURLWithPath: model.workspacePath).lastPathComponent }
+    private var connectionActionTitle: String {
+        if model.isConnecting { return "正在启动…" }
+        if !model.isConnected { return "重连后端" }
+        if model.isTestingConnection { return "正在验证…" }
+        return model.hasCredentials ? "发送" : "配置模型"
+    }
+    private var connectionSummary: String {
+        if model.isConnecting { return "正在启动本地后端" }
+        if !model.isConnected { return "本地后端已断开" }
+        if model.isTestingConnection { return "正在验证模型连接" }
+        return model.hasCredentials ? "模型已配置" : "待配置模型"
+    }
     private var visibleTasks: [AgentTask] {
         model.tasks.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) }
             .sorted { $0.updatedAt > $1.updatedAt }
@@ -117,7 +130,7 @@ struct WorkspaceView: View {
                 }.buttonStyle(.plain).help(model.workspacePath)
                 HStack(spacing: 6) {
                     Circle().fill(model.canRun ? Color.green : Color.secondary).frame(width: 5, height: 5)
-                    Text(model.canRun ? "模型已配置" : model.hasCredentials ? "后端未连接" : "待配置模型")
+                    Text(connectionSummary)
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }.padding(17)
@@ -128,7 +141,7 @@ struct WorkspaceView: View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.currentTask?.title ?? "新任务").font(.system(size: 15, weight: .semibold)).lineLimit(1)
-                Text(model.currentTask?.phase.label ?? (model.canRun ? "准备开始" : "先配置一个模型连接"))
+                Text(!model.isConnected ? connectionSummary : model.currentTask?.phase.label ?? (model.canRun ? "准备开始" : "先配置一个模型连接"))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Spacer(minLength: 10)
@@ -143,17 +156,22 @@ struct WorkspaceView: View {
 
     private var connectionNotice: some View {
         HStack(alignment: .center, spacing: 12) {
-            Image(systemName: "network").foregroundStyle(.secondary)
+            if model.isConnecting || model.isTestingConnection {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "network").foregroundStyle(.secondary)
+            }
             VStack(alignment: .leading, spacing: 4) {
-                Text(model.hasCredentials ? "本地后端尚未连接" : "连接你自己的模型")
+                Text(!model.isConnected || model.isTestingConnection ? connectionSummary : "连接你自己的模型")
                     .font(.system(size: 13, weight: .medium))
-                Text(model.hasCredentials ? model.connectionLabel : "填入 API 地址、模型名与 API Key；不需要注册 MyAgent 或登录 ChatGPT。")
+                Text(!model.isConnected ? "\(model.connectionLabel)。先恢复本地后端，再检查模型服务。" : model.isTestingConnection ? model.connectionTestStatus : "填写服务地址、模型 ID 与 API Key，密钥由本机钥匙串保存。")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
-            if model.hasCredentials {
-                Button("重试连接") { Task { await model.reconnect() } }.controlSize(.small)
+            if !model.isConnected {
+                Button(model.isConnecting ? "正在启动…" : "重试后端", action: retryBackend)
+                    .controlSize(.small).disabled(model.isConnecting || model.isTestingConnection)
             } else {
-                Button("配置模型") { model.showConnectionSetup = true }
+                Button(model.isTestingConnection ? "查看连接" : "配置模型") { model.showConnectionSetup = true }
                     .buttonStyle(.borderedProminent).controlSize(.small)
             }
         }.padding(.horizontal, 24).padding(.vertical, 12).background(Color.accentColor.opacity(0.045))
@@ -178,7 +196,12 @@ struct WorkspaceView: View {
             Text(text).font(.system(size: 12)).textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             if !model.canRun {
-                Button("连接设置") { model.showConnectionSetup = true }.controlSize(.small)
+                if !model.isConnected {
+                    Button("重试后端", action: retryBackend).controlSize(.small)
+                        .disabled(model.isConnecting || model.isTestingConnection)
+                } else {
+                    Button("连接设置") { model.showConnectionSetup = true }.controlSize(.small)
+                }
             }
             Button(action: model.clearError) { Image(systemName: "xmark") }
                 .buttonStyle(.plain).help("关闭这条提示")
@@ -186,7 +209,7 @@ struct WorkspaceView: View {
     }
 
     private var conversation: some View {
-        GeometryReader { viewport in
+        GeometryReader { _ in
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 25) {
@@ -208,19 +231,20 @@ struct WorkspaceView: View {
                         Color.clear.frame(height: 1).id("conversation-bottom")
                     }.padding(26).frame(maxWidth: 840, alignment: .leading).frame(maxWidth: .infinity)
                         .background {
-                            GeometryReader { geometry in
-                                Color.clear.preference(key: ConversationBottomKey.self,
-                                                       value: geometry.frame(in: .named("conversation-scroll")).maxY)
-                            }
+                            ConversationScrollObserver(onScrollBegan: {
+                                userIsScrolling = true
+                                followsLatest = false
+                            }, onScrollEnded: { atBottom in
+                                userIsScrolling = false
+                                followsLatest = atBottom
+                            })
                         }
-                }.coordinateSpace(name: "conversation-scroll")
-                    .onPreferenceChange(ConversationBottomKey.self) { bottom in
-                        followsLatest = bottom < viewport.size.height + 90
-                    }
+                }
                     .onChange(of: model.currentTask?.messages.last?.text) { _, _ in
-                        if followsLatest { proxy.scrollTo("conversation-bottom", anchor: .bottom) }
+                        if followsLatest && !userIsScrolling { proxy.scrollTo("conversation-bottom", anchor: .bottom) }
                     }
                     .onChange(of: model.selectedTaskID) { _, _ in
+                        userIsScrolling = false
                         followsLatest = true
                         DispatchQueue.main.async { proxy.scrollTo("conversation-bottom", anchor: .bottom) }
                     }
@@ -255,16 +279,16 @@ struct WorkspaceView: View {
                     Spacer(minLength: 4)
                     Text("⌘ Return").font(.system(size: 11)).foregroundStyle(.tertiary)
                     Button(action: send) {
-                        Label(model.canRun ? "发送" : model.hasCredentials ? "重新连接" : "配置模型", systemImage: model.canRun ? "arrow.up" : "network")
+                        Label(connectionActionTitle, systemImage: model.canRun ? "arrow.up" : "network")
                     }.buttonStyle(.borderedProminent).controlSize(.small)
-                        .disabled(model.isBusy || (model.canRun && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                        .disabled(model.isBusy || model.isConnecting || model.isTestingConnection || (model.canRun && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                         .help("发送任务（⌘Return），Return 换行")
                 }
             }.padding(11)
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
                 .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(Color.primary.opacity(0.13)) }
             HStack {
-                Text(model.isBusy ? (selectedIsRunning ? "执行中，可以先写下下一条。" : "其他任务正在执行，可以先起草。") : "Return 换行 · ⌘Return 发送")
+                Text(model.isBusy ? (selectedIsRunning ? "执行中，可以先写下下一条。" : "其他任务正在执行，可以先起草。") : model.draft.isEmpty ? "Return 换行 · ⌘Return 发送" : "当前任务草稿 · Return 换行 · ⌘Return 发送")
                 Spacer()
                 if model.settings.quietMode { Label("安静模式", systemImage: "bell.slash") }
             }.font(.system(size: 11)).foregroundStyle(.tertiary).padding(.horizontal, 2)
@@ -273,10 +297,15 @@ struct WorkspaceView: View {
     }
 
     private func send() {
-        guard !model.isBusy else { return }
-        if !model.hasCredentials { model.showConnectionSetup = true }
-        else if !model.isConnected { Task { await model.reconnect() } }
+        guard !model.isBusy, !model.isConnecting, !model.isTestingConnection else { return }
+        if !model.isConnected { retryBackend() }
+        else if !model.hasCredentials { model.showConnectionSetup = true }
         else { model.sendPrompt() }
+    }
+
+    private func retryBackend() {
+        model.clearError()
+        Task { await model.reconnect() }
     }
 
     private var inspector: some View {
@@ -407,9 +436,103 @@ private enum WorkspaceSheet: Identifiable {
     }
 }
 
-private struct ConversationBottomKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+/// Observes only the native scroll view containing this conversation. Content
+/// growth never changes follow mode; actual user scrolling does.
+private struct ConversationScrollObserver: NSViewRepresentable {
+    var onScrollBegan: () -> Void
+    var onScrollEnded: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeNSView(context: Context) -> ScrollMarkerView {
+        let view = ScrollMarkerView()
+        view.onAttach = { [weak coordinator = context.coordinator, weak view] in
+            if let view { coordinator?.attach(to: view) }
+        }
+        return view
+    }
+    func updateNSView(_ view: ScrollMarkerView, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.attach(to: view)
+    }
+    static func dismantleNSView(_ view: ScrollMarkerView, coordinator: Coordinator) {
+        view.onAttach = nil
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator {
+        var parent: ConversationScrollObserver
+        private weak var scrollView: NSScrollView?
+        private var tokens: [NSObjectProtocol] = []
+        private var liveScrolling = false
+        private var previousY: CGFloat = 0
+
+        init(_ parent: ConversationScrollObserver) { self.parent = parent }
+        func attach(to view: NSView) {
+            guard let scroll = view.enclosingScrollView, scroll !== scrollView else { return }
+            detach()
+            scrollView = scroll
+            previousY = scroll.documentVisibleRect.minY
+            let center = NotificationCenter.default
+            tokens.append(center.addObserver(forName: NSScrollView.willStartLiveScrollNotification, object: scroll, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.liveScrolling = true
+                    self.parent.onScrollBegan()
+                }
+            })
+            tokens.append(center.addObserver(forName: NSScrollView.didEndLiveScrollNotification, object: scroll, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.liveScrolling = false
+                    self.parent.onScrollEnded(self.isAtBottom)
+                }
+            })
+            scroll.contentView.postsBoundsChangedNotifications = true
+            tokens.append(center.addObserver(forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.boundsChanged() }
+            })
+        }
+        func detach() {
+            tokens.forEach(NotificationCenter.default.removeObserver)
+            tokens.removeAll()
+            scrollView = nil
+            liveScrolling = false
+        }
+        private var isAtBottom: Bool {
+            guard let scrollView, let document = scrollView.documentView else { return true }
+            return document.bounds.maxY - scrollView.documentVisibleRect.maxY <= 24
+        }
+        private func boundsChanged() {
+            guard let scrollView else { return }
+            let y = scrollView.documentVisibleRect.minY
+            let movedUp = y < previousY - 0.5
+            previousY = y
+            guard !liveScrolling else { return }
+            let atBottom = isAtBottom
+            // Keyboard and scrollbar jumps can change bounds without a live
+            // scroll gesture. Defer state writes out of AppKit layout.
+            if movedUp || atBottom {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !self.liveScrolling else { return }
+                    if movedUp { self.parent.onScrollBegan() }
+                    self.parent.onScrollEnded(atBottom)
+                }
+            }
+        }
+    }
+}
+
+private final class ScrollMarkerView: NSView {
+    var onAttach: (() -> Void)?
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        DispatchQueue.main.async { [weak self] in self?.onAttach?() }
+    }
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        DispatchQueue.main.async { [weak self] in self?.onAttach?() }
+    }
 }
 
 private struct MessageRow: View {
@@ -516,9 +639,20 @@ private struct GrowingPromptEditor: NSViewRepresentable {
 private final class PromptTextView: NSTextView {
     var onSend: (() -> Void)?
     var onResize: (() -> Void)?
+    private func isSendShortcut(_ event: NSEvent) -> Bool {
+        (event.keyCode == 36 || event.keyCode == 76)
+            && event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
+            && !hasMarkedText()
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if window?.firstResponder === self, isSendShortcut(event) {
+            onSend?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
     override func keyDown(with event: NSEvent) {
-        if (event.keyCode == 36 || event.keyCode == 76),
-           event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command), !hasMarkedText() {
+        if isSendShortcut(event) {
             onSend?()
         } else { super.keyDown(with: event) }
     }
@@ -535,21 +669,35 @@ private struct PermissionSheet: View {
         VStack(alignment: .leading, spacing: 20) {
             Label("需要你的授权", systemImage: "hand.raised").font(.system(size: 13, weight: .semibold)).foregroundStyle(Color.accentColor)
             Text(request.title).font(.system(size: 21, weight: .semibold))
-            Text(request.detail).font(.system(size: 13)).foregroundStyle(.secondary).textSelection(.enabled)
-            VStack(alignment: .leading, spacing: 14) {
-                detail("范围", request.scope)
-                detail("办公影响", request.kind == "desktop"
-                       ? "使用 AX 对授权应用定向操作，不切换前台、不注入全局键鼠。等待空闲 3 秒；20 秒仍忙则暂停。"
-                       : request.kind == "browser" ? "使用独立后台浏览器，不读取现有浏览器会话。" : "执行上方列明的项目操作。")
-                detail("授权时长", request.kind == "desktop" || request.kind == "browser"
-                       ? "确认后同一范围内有效 90 秒；范围改变或到期后重新请求授权。" : "仅这一次明确列出的操作。")
-            }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("请求内容").font(.system(size: 12, weight: .semibold))
+                        Text(request.detail)
+                            .font(request.kind == "execution" ? .system(size: 12, design: .monospaced) : .system(size: 13))
+                            .lineSpacing(4).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    VStack(alignment: .leading, spacing: 14) {
+                        detail("范围", request.scope)
+                        detail("办公影响", request.kind == "desktop"
+                               ? "使用 AX 对授权应用定向操作，不切换前台、不注入全局键鼠。等待空闲 3 秒；20 秒仍忙则暂停。"
+                               : request.kind == "browser" ? "使用独立后台浏览器，不读取现有浏览器会话。" : "执行上方列明的项目操作。")
+                        detail("授权时长", request.kind == "desktop" || request.kind == "browser"
+                               ? "确认后同一范围内有效 90 秒；范围改变或到期后重新请求授权。" : "仅这一次明确列出的操作。")
+                    }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+                }.padding(.trailing, 3)
+            }.frame(maxHeight: 350)
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 let seconds = max(0, Int(request.expiresAt.timeIntervalSince(context.date)))
                 HStack {
-                    Text(seconds > 0 ? "确认窗口剩余 \(seconds) 秒" : "请求已过期").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Button("停止任务", role: .destructive, action: model.stop)
+                        .keyboardShortcut(".", modifiers: .command)
                     Spacer()
+                    Text(seconds > 0 ? "确认剩余 \(seconds) 秒" : "请求已过期").font(.system(size: 11)).foregroundStyle(.secondary)
                     Button("拒绝") { model.respondPermission(false) }.keyboardShortcut(.cancelAction)
                     Button("同意") { model.respondPermission(true) }.buttonStyle(.borderedProminent).disabled(seconds == 0)
                 }
@@ -611,6 +759,8 @@ private struct ChoiceSheet: View {
                 }.padding(.trailing, 3)
             }.frame(maxHeight: 570)
             HStack {
+                Button("停止任务", role: .destructive, action: model.stop)
+                    .keyboardShortcut(".", modifiers: .command)
                 Spacer()
                 Button("取消选择", action: model.declineChoice).keyboardShortcut(.cancelAction)
             }

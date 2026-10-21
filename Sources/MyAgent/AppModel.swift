@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var accountLabel = "尚未配置模型"
     @Published var connectionLabel = "本地后端未连接"
     @Published var isConnected = false
+    @Published private(set) var isConnecting = false
     @Published var authInProgress = false
     @Published var providerDraft = ProviderDraft()
     @Published var apiKeyDraft = ""
@@ -39,14 +40,18 @@ final class AppModel: ObservableObject {
     private let defaultWorkspace: URL
     private let stateFile: URL
     private let engineBinaryOverride: URL?
+    private let credentialStore: any CredentialStore
+    private let usesBackendPersistence: Bool
     private let connection = AgentConnection()
     private let browser = NativeBrowser()
     private let desktop = NativeDesktop()
-    private var connecting = false
+    private var startupTask: Task<Void, Never>?
+    private var connectionEpoch = UUID()
     private var authenticated = false
     private var savedProvider = ProviderDraft()
     private var taskDrafts: [UUID: String] = [:]
     private var stateRevision: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    private var localSnapshotRevision: Int64 = 0
     private var draftSaveTask: Task<Void, Never>?
     private var turnID: String?
     private var turnStartTicket = UUID()
@@ -57,6 +62,7 @@ final class AppModel: ObservableObject {
     private var streamingMessages: [String: UUID] = [:]
     private var toolTasks: [String: Task<Void, Never>] = [:]
     private var permissionReply: ((Bool) -> Void)?
+    private var permissionExpiryTask: Task<Void, Never>?
     private var choiceReply: ((String?) -> Void)?
     private var leases: [String: Date] = [:]
     private var leaseTimer: Task<Void, Never>?
@@ -66,13 +72,15 @@ final class AppModel: ObservableObject {
 
     var currentTask: AgentTask? { tasks.first { $0.id == selectedTaskID } }
     var isBusy: Bool { activeTaskID != nil }
-    var canRun: Bool { isConnected && hasCredentials }
+    var canRun: Bool { isConnected && hasCredentials && !isConnecting && !isTestingConnection }
     var workspacePath: String { currentTask?.workspace ?? defaultWorkspace.path }
 
-    init(dataDirectory: URL? = nil, engineBinary: URL? = nil) {
+    init(dataDirectory: URL? = nil, engineBinary: URL? = nil, credentialStore: (any CredentialStore)? = nil, usesBackendPersistence: Bool? = nil) {
         let root = dataDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MyAgent", isDirectory: true)
         self.dataDirectory = root
         engineBinaryOverride = engineBinary
+        self.credentialStore = credentialStore ?? KeychainCredentialStore()
+        self.usesBackendPersistence = usesBackendPersistence ?? (engineBinary == nil)
         engineHome = root.appendingPathComponent("engine", isDirectory: true)
         defaultWorkspace = root.appendingPathComponent("Workspace", isDirectory: true)
         stateFile = root.appendingPathComponent("state.json")
@@ -82,6 +90,8 @@ final class AppModel: ObservableObject {
             }
             if FileManager.default.fileExists(atPath: stateFile.path) {
                 let state = try JSONDecoder().decode(PersistedAppState.self, from: Data(contentsOf: stateFile))
+                localSnapshotRevision = state.revision ?? 0
+                stateRevision = max(stateRevision, localSnapshotRevision)
                 tasks = state.tasks.map { task in
                     var recovered = task
                     if [.running, .waiting, .connecting].contains(task.phase) { recovered.phase = .paused }
@@ -113,12 +123,20 @@ final class AppModel: ObservableObject {
     }
 
     func connect() async {
-        guard !isConnected, !connecting else { return }
-        connecting = true
+        if let startupTask { await startupTask.value; return }
+        guard !isConnected else { return }
+        isConnecting = true
+        let epoch = connectionEpoch
+        let work = Task { await startBackend(epoch: epoch) }
+        startupTask = work
+        await work.value
+        if epoch == connectionEpoch { startupTask = nil; isConnecting = false }
+    }
+
+    private func startBackend(epoch: UUID) async {
         let initialSelection = selectedTaskID
         let initialDraft = draft
         connectionLabel = "正在启动本地后端"
-        defer { connecting = false }
         do {
             let binary: URL
             if let override = engineBinaryOverride {
@@ -132,11 +150,16 @@ final class AppModel: ObservableObject {
                 binary = FileManager.default.isExecutableFile(atPath: release.path) ? release : root.appendingPathComponent("backend/target/debug/myagent-backend")
             }
             try await connection.launch(binary: binary, home: engineHome)
+            try Task.checkCancellation()
+            guard epoch == connectionEpoch else { return }
             isConnected = true
             connectionLabel = "本地后端已连接"
-            if engineBinaryOverride == nil {
+            if usesBackendPersistence {
                 let stored = try await connection.call("app/state/read")
-                if let revision = stored["revision"] as? NSNumber { stateRevision = max(stateRevision, revision.int64Value) }
+                try Task.checkCancellation()
+                guard epoch == connectionEpoch else { return }
+                let databaseRevision = (stored["revision"] as? NSNumber)?.int64Value ?? 0
+                stateRevision = max(stateRevision, databaseRevision)
                 if let object = stored["state"] as? [String: Any], JSONSerialization.isValidJSONObject(object) {
                     let data = try JSONSerialization.data(withJSONObject: object)
                     if let state = try? JSONDecoder().decode(PersistedAppState.self, from: data) {
@@ -145,7 +168,7 @@ final class AppModel: ObservableObject {
                             if [.running, .connecting, .waiting].contains(task.phase) { recovered.phase = .paused }
                             return recovered
                         }
-                        if selectedTaskID == initialSelection && draft == initialDraft {
+                        if selectedTaskID == initialSelection && draft == initialDraft && databaseRevision >= localSnapshotRevision {
                             tasks = recovered
                             settings = state.settings
                             selectedTaskID = state.selectedTaskID
@@ -158,16 +181,19 @@ final class AppModel: ObservableObject {
                         }
                     }
                 }
-                if let key = try SecureStore.read(credentialAccount(savedProvider)) {
+                if let key = try credentialStore.read(credentialAccount(savedProvider), allowInteraction: false) {
                     _ = try await connection.call("provider/configure", params: providerParameters(savedProvider, key: key))
                 }
             }
+            try Task.checkCancellation()
+            guard epoch == connectionEpoch else { return }
             await refreshAccount()
             await refreshModels()
-            if !hasCredentials && engineBinaryOverride == nil { showConnectionSetup = true; connectionLabel = "本地后端就绪 · 请配置模型" }
+            if !hasCredentials && usesBackendPersistence { showConnectionSetup = true; connectionLabel = "本地后端就绪 · 请配置模型" }
             log("本地后端已就绪", "任务和执行记录保存在本机 SQLite 数据库。")
             persist()
         } catch {
+            guard epoch == connectionEpoch, !Task.isCancelled else { return }
             lastError = error.localizedDescription
             if !isConnected { connectionLabel = "启动失败" }
         }
@@ -175,10 +201,37 @@ final class AppModel: ObservableObject {
 
     func reconnect() async {
         stop()
+        let previous = startupTask
+        connectionEpoch = UUID()
+        previous?.cancel()
         connection.stop()
+        startupTask = nil
+        isConnecting = false
         isConnected = false
+        hasCredentials = false
+        authenticated = false
         resumedThreads.removeAll()
+        await previous?.value
         await connect()
+    }
+
+    func shutdown() {
+        connectionEpoch = UUID()
+        startupTask?.cancel()
+        startupTask = nil
+        draftSaveTask?.cancel()
+        if let id = selectedTaskID, let i = tasks.firstIndex(where: { $0.id == id }) { tasks[i].draft = draft }
+        stop()
+        isConnected = false
+        isConnecting = false
+        hasCredentials = false
+        authenticated = false
+        connection.stop()
+    }
+
+    func shutdownAndWait() async throws {
+        shutdown()
+        try await connection.stopAndWait()
     }
 
     private func refreshAccount() async {
@@ -210,7 +263,7 @@ final class AppModel: ObservableObject {
     private func keyForDraft(_ provider: ProviderDraft, enteredKey: String) throws -> String {
         let entered = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !entered.isEmpty { return entered }
-        if let stored = try SecureStore.read(credentialAccount(provider)), !stored.isEmpty { return stored }
+        if let stored = try credentialStore.read(credentialAccount(provider), allowInteraction: true), !stored.isEmpty { return stored }
         throw AppFailure.message("请填写此模型服务的 API Key。密钥仅保存到 macOS 钥匙串。")
     }
 
@@ -220,6 +273,7 @@ final class AppModel: ObservableObject {
     private func performConnection(save: Bool) {
         guard !isTestingConnection, !isBusy else { return }
         isTestingConnection = true
+        lastError = nil
         connectionTestStatus = "正在连接模型服务…"
         let candidate = providerDraft
         let enteredKey = apiKeyDraft
@@ -227,7 +281,6 @@ final class AppModel: ObservableObject {
             defer { isTestingConnection = false }
             do {
                 if !isConnected {
-                    if connecting { throw AppFailure.message("本地后端正在启动，请稍候再试。") }
                     await connect()
                 }
                 guard isConnected else { throw AppFailure.message("本地后端未启动，请先重新连接。") }
@@ -242,8 +295,19 @@ final class AppModel: ObservableObject {
                     if !ids.isEmpty && !ids.contains(candidate.model.trimmingCharacters(in: .whitespacesAndNewlines)) {
                         throw AppFailure.message("服务已连接，但模型列表中没有“\(candidate.model)”。请填写返回的实际模型 ID。")
                     }
-                    _ = try await connection.call("provider/configure", params: providerParameters(candidate, key: key))
-                    try SecureStore.save(key, account: credentialAccount(candidate))
+                    let account = credentialAccount(candidate)
+                    let oldKey = try credentialStore.read(account, allowInteraction: true)
+                    // Persist first. A Keychain failure must never activate an unsaved provider.
+                    try credentialStore.save(key, account: account)
+                    do {
+                        _ = try await connection.call("provider/configure", params: providerParameters(candidate, key: key))
+                    } catch {
+                        do {
+                            if let oldKey { try credentialStore.save(oldKey, account: account) }
+                            else { try credentialStore.remove(account) }
+                        } catch { lastError = "连接未启用，恢复原钥匙串记录失败：\(error.localizedDescription)" }
+                        throw error
+                    }
                     var normalized = candidate
                     normalized.baseURL = candidate.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     normalized.model = candidate.model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -265,7 +329,7 @@ final class AppModel: ObservableObject {
 
     func disconnectProvider() {
         guard !isBusy else { lastError = "请先停止正在执行的任务。"; return }
-        do { try SecureStore.remove(credentialAccount(savedProvider)) }
+        do { try credentialStore.remove(credentialAccount(savedProvider)) }
         catch { lastError = error.localizedDescription; return }
         hasCredentials = false
         authenticated = false
@@ -330,7 +394,7 @@ final class AppModel: ObservableObject {
 
     func sendPrompt() {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty, !isBusy else { return }
+        guard !prompt.isEmpty, !isBusy, !isTestingConnection else { return }
         guard authenticated else { showConnectionSetup = true; return }
         guard isConnected else { lastError = "Agent 运行时尚未连接。"; return }
         if currentTask == nil { newTask() }
@@ -543,7 +607,12 @@ final class AppModel: ObservableObject {
                     replyTool(id, value, success: true)
                 } catch { replyTool(id, ["error": error.localizedDescription], success: false) }
             } else if method == "item/commandExecution/requestApproval" || method == "item/fileChange/requestApproval" {
-                let allowed = await askPermission(title: method.contains("command") ? "允许执行这条命令？" : "允许修改这些文件？", detail: "\(params["command"] as? String ?? params["reason"] as? String ?? "当前项目的操作需要批准")\n目录：\(params["cwd"] as? String ?? task.workspace)", scope: "仅这一次操作", kind: "execution")
+                var details = [String]()
+                if let command = params["command"] as? String { details.append("命令：\n" + command) }
+                if let reason = params["reason"] as? String { details.append("说明：\n" + reason) }
+                details.append("目录：" + (params["cwd"] as? String ?? task.workspace))
+                if let changes = params["changes"], JSONSerialization.isValidJSONObject(changes), let data = try? JSONSerialization.data(withJSONObject: changes, options: [.prettyPrinted, .sortedKeys]), let text = String(data: data, encoding: .utf8) { details.append("文件变更：\n" + String(text.prefix(20_000))) }
+                let allowed = await askPermission(title: method.contains("command") ? "允许执行这条命令？" : "允许修改这些文件？", detail: details.joined(separator: "\n\n"), scope: "仅这一次操作", kind: "execution")
                 connection.respond(id: id, result: ["decision": allowed && generation == runGeneration ? "accept" : "decline"])
             } else if method == "item/tool/requestUserInput" {
                 var answers: [String: Any] = [:]
@@ -648,14 +717,16 @@ final class AppModel: ObservableObject {
             permissionReply = { continuation.resume(returning: $0) }
             if !settings.quietMode { NSSound.beep() }
             if let activeTaskID { setPhase(.waiting, activeTaskID) }
-            Task {
+            permissionExpiryTask = Task { [weak self] in
                 do { try await Task.sleep(nanoseconds: 90_000_000_000) } catch { return }
-                if pendingPermission?.id == request.id { respondPermission(false) }
+                if self?.pendingPermission?.id == request.id { self?.respondPermission(false) }
             }
         }
     }
 
     func respondPermission(_ allowed: Bool) {
+        permissionExpiryTask?.cancel()
+        permissionExpiryTask = nil
         let callback = permissionReply
         permissionReply = nil
         let valid = pendingPermission.map { $0.expiresAt > Date() } ?? false
@@ -742,12 +813,13 @@ final class AppModel: ObservableObject {
 
     private func persist() {
         do {
-            let state = PersistedAppState(selectedTaskID: selectedTaskID, tasks: tasks, settings: settings, provider: savedProvider, unassignedDraft: selectedTaskID == nil ? draft : nil)
+            stateRevision = max(stateRevision + 1, Int64(Date().timeIntervalSince1970 * 1_000))
+            localSnapshotRevision = stateRevision
+            let state = PersistedAppState(selectedTaskID: selectedTaskID, tasks: tasks, settings: settings, provider: savedProvider, unassignedDraft: selectedTaskID == nil ? draft : nil, revision: stateRevision)
             let data = try JSONEncoder().encode(state)
             try data.write(to: stateFile, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateFile.path)
-            if isConnected, engineBinaryOverride == nil, let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                stateRevision = max(stateRevision + 1, Int64(Date().timeIntervalSince1970 * 1_000))
+            if isConnected, usesBackendPersistence, let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 let revision = stateRevision
                 Task { _ = try? await connection.call("app/state/write", params: ["state": object, "revision": revision]) }
             }

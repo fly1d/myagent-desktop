@@ -137,7 +137,10 @@ fn emit_delta(
 }
 
 fn assistant_message(completion: &Completion) -> Value {
-    let mut message = json!({"role":"assistant","content":if completion.content.is_empty() {Value::Null} else {json!(completion.content)}});
+    let mut message = json!({"role":"assistant","content":completion.content});
+    if let Some(reasoning) = &completion.reasoning_content {
+        message["reasoning_content"] = json!(reasoning);
+    }
     if !completion.tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(completion.tool_calls.iter().map(|call|json!({
             "id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}
@@ -261,18 +264,19 @@ async fn run_tool(
             "write_file" => write_file(ctx, workspace, &arguments, &item_id).await,
             "run_command" => run_command(ctx, workspace, &arguments, &item_id).await,
             name if native_names.contains(name) => {
-                ctx.request_native(
+                let reply = ctx.request_native(
                     "item/tool/call",
                     json!({"tool":name,"arguments":arguments,"callId":call.id,"itemId":item_id}),
                 )
-                .await
+                .await;
+                reply.and_then(native_tool_result)
             }
             _ => Err(anyhow!("模型请求了未注册的工具。")),
         }
     };
     if result
         .as_ref()
-        .is_err_and(|error| error.to_string().contains("用户拒绝"))
+        .is_err_and(|error| is_user_denial(&error.to_string()))
     {
         denied.insert(fingerprint);
     }
@@ -285,6 +289,43 @@ async fn run_tool(
     }
     ctx.emit("item/completed", json!({"item":item}))?;
     result
+}
+
+fn native_tool_result(reply: Value) -> Result<Value> {
+    if reply.get("success") != Some(&json!(false)) {
+        return Ok(reply);
+    }
+    let message = reply
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            reply["contentItems"].as_array().and_then(|items| {
+                items.iter().find_map(|item| {
+                    let text = item["text"].as_str()?;
+                    serde_json::from_str::<Value>(text)
+                        .ok()?
+                        .get("error")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            })
+        })
+        .unwrap_or_else(|| "原生工具返回失败，未执行成功。".into());
+    bail!("{}", message.chars().take(2000).collect::<String>())
+}
+
+fn is_user_denial(message: &str) -> bool {
+    [
+        "用户拒绝",
+        "用户未授权",
+        "用户取消",
+        "permission_denied",
+        "Permission denied",
+        "User declined",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn check_cancelled(ctx: &TurnContext) -> Result<()> {
@@ -633,6 +674,7 @@ mod tests {
     use super::*;
     use crate::{provider::ProviderConfig, store::Store, State};
     use std::sync::Arc;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
     use tokio_util::sync::CancellationToken;
 
     fn temporary() -> PathBuf {
@@ -716,6 +758,25 @@ mod tests {
     }
 
     #[test]
+    fn resumed_tool_batch_preserves_known_denial_and_marks_missing_results_unknown() {
+        let known = json!({"role":"tool","tool_call_id":"call-a","content":"{\"ok\":false,\"error\":\"用户拒绝\"}"});
+        let history = repair_history(&[
+            json!({"role":"user","content":"run two actions"}),
+            json!({"role":"assistant","content":"","reasoning_content":"retained-protocol-state","tool_calls":[{"id":"call-a"},{"id":"call-b"}]}),
+            known.clone(),
+            json!({"role":"user","content":"resume after interruption"}),
+        ]);
+        assert_eq!(history[1]["reasoning_content"], "retained-protocol-state");
+        assert_eq!(history[2], known);
+        assert_eq!(history[3]["tool_call_id"], "call-b");
+        assert!(history[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted"));
+        assert_eq!(history[4]["role"], "user");
+    }
+
+    #[test]
     fn converts_dynamic_functions_and_refuses_builtin_collisions() {
         let (tools, names) = model_tools(&[
             json!({"name":"browser","description":"native","inputSchema":{"type":"object"}}),
@@ -759,6 +820,216 @@ mod tests {
             },
             receiver,
         )
+    }
+
+    async fn chat_fixture(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}/v1", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0);
+                    request.extend_from_slice(&buffer[..size]);
+                    assert!(request.len() < 2 * 1024 * 1024);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let size = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|size| size.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + size {
+                            assert!(headers.starts_with("POST /v1/chat/completions "));
+                            requests.push(
+                                serde_json::from_slice::<Value>(&request[end + 4..end + 4 + size])
+                                    .unwrap(),
+                            );
+                            break;
+                        }
+                    }
+                }
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len());
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+        (address, task)
+    }
+
+    fn completion_fixture(delta: Value, reason: &str) -> String {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]})
+        )
+    }
+
+    #[tokio::test]
+    async fn real_http_tool_round_trip_preserves_deepseek_state_and_verifies_written_file() {
+        let root = temporary();
+        let (mut ctx, mut events) = context(&root);
+        let first_state = "fixture-private-protocol-state-1";
+        let second_state = "fixture-private-protocol-state-2";
+        let responses = vec![
+            completion_fixture(
+                json!({"reasoning_content":first_state,"tool_calls":[{"index":0,"id":"write-a","type":"function","function":{"name":"write_file","arguments":json!({"path":"deliverables/实际交付.txt","content":"已经核验的中文交付物"}).to_string()}}]}),
+                "tool_calls",
+            ),
+            completion_fixture(
+                json!({"reasoning_content":second_state,"tool_calls":[{"index":0,"id":"read-a","type":"function","function":{"name":"read_file","arguments":json!({"path":"deliverables/实际交付.txt"}).to_string()}}]}),
+                "tool_calls",
+            ),
+            completion_fixture(
+                json!({"reasoning_content":"fixture-private-protocol-state-3","content":"已写入并核对文件。"}),
+                "stop",
+            ),
+        ];
+        let (address, server) = chat_fixture(responses).await;
+        ctx.provider.base_url = address;
+        ctx.provider.provider = "deepseek".into();
+        let user = json!({"role":"user","content":"在项目里创建中文交付物并核对"});
+        ctx.record_message(&user).unwrap();
+        ctx.messages = vec![user];
+        let state = ctx.state.clone();
+        let thread_id = ctx.thread.id.clone();
+        let reviewer_state = state.clone();
+        let reviewer = tokio::spawn(async move {
+            let mut collected = Vec::new();
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+            {
+                if event["method"] == "item/fileChange/requestApproval" {
+                    reviewer_state
+                        .receive_reply(json!({"id":event["id"],"result":{"decision":"accept"}}));
+                }
+                let finished = event["method"] == "item/completed"
+                    && event["params"]["item"]["text"] == "已写入并核对文件。";
+                collected.push(event);
+                if finished {
+                    break;
+                }
+            }
+            collected
+        });
+        tokio::time::timeout(Duration::from_secs(5), run_turn(ctx))
+            .await
+            .unwrap()
+            .unwrap();
+        let requests = server.await.unwrap();
+        let events = reviewer.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request.get("tool_choice").is_none()));
+        assert_eq!(requests[1]["messages"][2]["reasoning_content"], first_state);
+        assert_eq!(requests[1]["messages"][2]["content"], "");
+        let last_tool = requests[2]["messages"].as_array().unwrap().last().unwrap();
+        let read_result: Value =
+            serde_json::from_str(last_tool["content"].as_str().unwrap()).unwrap();
+        assert_eq!(read_result["content"], "已经核验的中文交付物");
+        assert_eq!(
+            requests[2]["messages"][4]["reasoning_content"],
+            second_state
+        );
+        let persisted = state.store.lock().unwrap().messages(&thread_id).unwrap();
+        assert_eq!(persisted.len(), 6);
+        assert_eq!(persisted[1]["reasoning_content"], first_state);
+        assert_eq!(persisted[3]["reasoning_content"], second_state);
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("fixture-private-protocol-state"));
+        assert_eq!(
+            fs::read_to_string(root.join("deliverables/实际交付.txt")).unwrap(),
+            "已经核验的中文交付物"
+        );
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_denial_is_recorded_and_identical_action_does_not_request_again() {
+        let root = temporary();
+        let (ctx, mut events) = context(&root);
+        let state = ctx.state.clone();
+        let reviewer = tokio::spawn(async move {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event["method"] == "item/tool/call" {
+                    state.receive_reply(json!({"id":event["id"],"result":{"success":false,"contentItems":[{"type":"inputText","text":json!({"error":"用户未授权本次控制；请提供可在后台完成的下一步。"}).to_string()}]}}));
+                    return events;
+                }
+            }
+        });
+        let call = ToolCall {
+            id: "browser-a".into(),
+            name: "browser".into(),
+            arguments: json!({"action":"open","url":"https://example.com"}).to_string(),
+        };
+        let workspace = Workspace::new(root.to_str().unwrap()).unwrap();
+        let names = HashSet::from(["browser".into()]);
+        let mut denied = HashSet::new();
+        assert!(run_tool(&ctx, &workspace, &names, &mut denied, &call)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("用户未授权"));
+        let mut events = reviewer.await.unwrap();
+        assert!(run_tool(&ctx, &workspace, &names, &mut denied, &call)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("用户拒绝"));
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event["method"], "item/tool/call");
+        }
+        drop(ctx);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn broken_sse_marks_visible_answer_incomplete_and_preserves_only_real_partial_text() {
+        let root = temporary();
+        let (mut ctx, mut events) = context(&root);
+        let body = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"reasoning_content":"unfinished-private-state","content":"这是实际收到的部分回答"},"finish_reason":null}]})
+        );
+        let (address, server) = chat_fixture(vec![body]).await;
+        ctx.provider.base_url = address;
+        ctx.provider.provider = "deepseek".into();
+        let user = json!({"role":"user","content":"测试断流"});
+        ctx.record_message(&user).unwrap();
+        ctx.messages = vec![user];
+        let state = ctx.state.clone();
+        let thread_id = ctx.thread.id.clone();
+        assert!(run_turn(ctx).await.is_err());
+        server.await.unwrap();
+        let persisted = state.store.lock().unwrap().messages(&thread_id).unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1]["content"], "这是实际收到的部分回答");
+        assert!(persisted[1].get("tool_calls").is_none());
+        assert!(persisted[1].get("reasoning_content").is_none());
+        let mut incomplete = false;
+        while let Ok(event) = events.try_recv() {
+            assert!(!event.to_string().contains("unfinished-private-state"));
+            if event["method"] == "item/completed" {
+                assert_eq!(event["params"]["item"]["status"], "incomplete");
+                incomplete = true;
+            }
+        }
+        assert!(incomplete);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

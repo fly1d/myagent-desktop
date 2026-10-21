@@ -18,18 +18,33 @@ pub struct ThreadRecord {
 
 pub struct Store {
     connection: Connection,
+    // Recovery must only run after the previous backend has released this home.
+    _ownership: std::fs::File,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let ownership = options.open(std::path::PathBuf::from(lock_path))?;
+        ownership
+            .try_lock()
+            .context("Another backend already owns this application database")?;
         let mut connection = Connection::open(path).context("Cannot open application database")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             bail!("Database schema is newer than this backend");
         }
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "foreign_keys", true)?;
         if version == 0 {
             let transaction = connection.transaction()?;
             transaction.execute_batch(
@@ -70,7 +85,10 @@ impl Store {
                 }
             }
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _ownership: ownership,
+        })
     }
 
     pub fn create_thread(
@@ -137,6 +155,34 @@ impl Store {
             [thread],
         )?;
         Ok(())
+    }
+
+    pub fn begin_turn(
+        &mut self,
+        thread: &str,
+        id: &str,
+        message: &Value,
+        model_override: Option<&str>,
+    ) -> Result<Vec<Value>> {
+        let payload = serde_json::to_string(message)?;
+        if payload.len() > 1024 * 1024 {
+            bail!("Message exceeds the 1 MB persistence limit");
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO turns(id,thread_id,status) VALUES(?1,?2,'inProgress')",
+            params![id, thread],
+        )?;
+        transaction.execute(
+            "INSERT INTO messages(thread_id,turn_id,payload) VALUES(?1,?2,?3)",
+            params![thread, id, payload],
+        )?;
+        transaction.execute(
+            "UPDATE threads SET updated_at=unixepoch(),model=COALESCE(?2,model) WHERE id=?1",
+            params![thread, model_override],
+        )?;
+        transaction.commit()?;
+        self.messages(thread)
     }
 
     pub fn finish_turn(&mut self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
@@ -337,6 +383,62 @@ mod tests {
                 .pragma_update(None, "user_version", SCHEMA_VERSION + 1)?;
         }
         assert!(Store::open(&path).is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn live_database_cannot_be_recovered_by_a_second_backend() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("myagent-exclusive-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("test.sqlite");
+        let mut store = Store::open(&path)?;
+        let thread = store.create_thread(dir.display().to_string(), String::new(), vec![], None)?;
+        store.create_turn(&thread.id, "still-running")?;
+        assert!(Store::open(&path).is_err());
+        assert_eq!(store.turns(&thread.id)?[0]["status"], "inProgress");
+        drop(store);
+        let recovered = Store::open(&path)?;
+        assert_eq!(recovered.turns(&thread.id)?[0]["status"], "interrupted");
+        drop(recovered);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_initial_message_does_not_create_a_turn_or_change_model() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("myagent-transaction-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("test.sqlite");
+        let mut store = Store::open(&path)?;
+        let thread = store.create_thread(
+            dir.display().to_string(),
+            String::new(),
+            vec![],
+            Some("original".into()),
+        )?;
+        assert!(store
+            .begin_turn(
+                &thread.id,
+                "rejected",
+                &json!({"role":"user","content":"x".repeat(1024*1024)}),
+                Some("must-not-save")
+            )
+            .is_err());
+        assert!(store.turns(&thread.id)?.is_empty());
+        assert!(store.messages(&thread.id)?.is_empty());
+        assert_eq!(store.thread(&thread.id)?.model.as_deref(), Some("original"));
+        store.begin_turn(
+            &thread.id,
+            "valid",
+            &json!({"role":"user","content":"hello"}),
+            Some("new-model"),
+        )?;
+        assert_eq!(
+            store.thread(&thread.id)?.model.as_deref(),
+            Some("new-model")
+        );
+        drop(store);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

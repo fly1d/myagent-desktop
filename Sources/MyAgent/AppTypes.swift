@@ -103,6 +103,7 @@ struct PersistedAppState: Codable {
     var settings: AppSettings
     var provider: ProviderDraft? = nil
     var unassignedDraft: String? = nil
+    var revision: Int64? = nil
 }
 
 enum AppFailure: LocalizedError {

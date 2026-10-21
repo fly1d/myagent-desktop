@@ -3,9 +3,11 @@ pub mod runner;
 pub mod store;
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::FutureExt;
 use provider::ProviderConfig;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use store::{Store, ThreadRecord};
 use tokio::sync::{mpsc, oneshot};
@@ -23,6 +25,7 @@ pub struct State {
     pub active: Mutex<HashMap<String, ActiveTurn>>,
     outgoing: mpsc::UnboundedSender<Value>,
     pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    closed: AtomicBool,
 }
 
 impl State {
@@ -33,10 +36,14 @@ impl State {
             active: Mutex::new(HashMap::new()),
             outgoing,
             pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
     pub fn send(&self, message: Value) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            bail!("Native client disconnected");
+        }
         self.outgoing
             .send(message)
             .map_err(|_| anyhow!("Native client disconnected"))
@@ -61,6 +68,11 @@ impl State {
     }
 
     pub fn cancel_all(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.cancel_turns();
+    }
+
+    fn cancel_turns(&self) {
         if let Ok(active) = self.active.lock() {
             for turn in active.values() {
                 turn.cancel.cancel();
@@ -68,6 +80,18 @@ impl State {
         }
         if let Ok(mut pending) = self.pending.lock() {
             pending.clear();
+        }
+    }
+}
+
+struct PendingRequest {
+    state: Arc<State>,
+    id: String,
+}
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.state.pending.lock() {
+            pending.remove(&self.id);
         }
     }
 }
@@ -135,11 +159,16 @@ impl TurnContext {
             .lock()
             .map_err(|_| anyhow!("Request lock failed"))?
             .insert(id.clone(), sender);
+        // The outer turn cancellation can drop this entire future before its
+        // select branch runs. A guard also handles that drop path.
+        let _pending = PendingRequest {
+            state: self.state.clone(),
+            id: id.clone(),
+        };
         if let Err(error) = self
             .state
             .send(json!({"id":id,"method":method,"params":params}))
         {
-            self.state.pending.lock().unwrap().remove(&id);
             return Err(error);
         }
         let reply = tokio::select! {
@@ -148,11 +177,6 @@ impl TurnContext {
             result=receiver=>result.map_err(|_|anyhow!("Native client disconnected")),
             _=tokio::time::sleep(std::time::Duration::from_secs(900))=>Err(anyhow!("Native request timed out")),
         };
-        self.state
-            .pending
-            .lock()
-            .map_err(|_| anyhow!("Request lock failed"))?
-            .remove(&id);
         let reply = reply?;
         if let Some(error) = reply.get("error") {
             bail!(
@@ -168,9 +192,12 @@ impl TurnContext {
 }
 
 pub async fn dispatch(state: Arc<State>, method: &str, params: Value) -> Result<Value> {
+    if state.closed.load(Ordering::Acquire) {
+        bail!("Native client disconnected");
+    }
     match method {
         "initialize" => Ok(
-            json!({"userAgent":"MyAgent Local Backend/0.2.0","platformFamily":"unix","platformOs":std::env::consts::OS}),
+            json!({"userAgent":format!("MyAgent Local Backend/{}",env!("CARGO_PKG_VERSION")),"platformFamily":"unix","platformOs":std::env::consts::OS}),
         ),
         "backend/health" => Ok(
             json!({"backend":"myagent-rust","version":env!("CARGO_PKG_VERSION"),"database":"sqlite","schemaVersion":store::SCHEMA_VERSION,"configured":state.provider.lock().unwrap().is_some()}),
@@ -212,6 +239,7 @@ pub async fn dispatch(state: Arc<State>, method: &str, params: Value) -> Result<
         }
         "account/logout" => {
             *state.provider.lock().unwrap() = None;
+            state.cancel_turns();
             state.notify("account/updated", json!({"authMode":null,"planType":null}))?;
             Ok(json!({}))
         }
@@ -311,7 +339,7 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
     let thread_id = params["threadId"]
         .as_str()
         .context("threadId is required")?;
-    let thread = state.store.lock().unwrap().thread(thread_id)?;
+    let mut thread = state.store.lock().unwrap().thread(thread_id)?;
     let mut provider = state
         .provider
         .lock()
@@ -323,6 +351,7 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
     }
     if let Some(model) = params["model"].as_str() {
         provider.model = model.to_owned();
+        thread.model = Some(model.to_owned());
     }
     provider.validate()?;
     let text = params["input"]
@@ -340,6 +369,9 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
     let cancel = CancellationToken::new();
     {
         let mut active = state.active.lock().unwrap();
+        if state.closed.load(Ordering::Acquire) {
+            bail!("Native client disconnected");
+        }
         if active.contains_key(thread_id) {
             bail!("This thread already has an active turn");
         }
@@ -353,13 +385,21 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
     }
     let prepared = (|| -> Result<Vec<Value>> {
         let mut store = state.store.lock().unwrap();
-        store.create_turn(thread_id, &turn_id)?;
-        store.add_message(thread_id, &turn_id, &json!({"role":"user","content":text}))?;
-        store.messages(thread_id)
+        store.begin_turn(
+            thread_id,
+            &turn_id,
+            &json!({"role":"user","content":text}),
+            params["model"].as_str(),
+        )
     })();
     let messages = match prepared {
         Ok(m) => m,
         Err(error) => {
+            let _ = state.store.lock().unwrap().finish_turn(
+                &turn_id,
+                "failed",
+                Some("Unable to prepare turn history"),
+            );
             state.active.lock().unwrap().remove(thread_id);
             return Err(error);
         }
@@ -373,20 +413,35 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
         cancel: cancel.clone(),
     };
     let running = json!({"id":turn_id,"status":"inProgress","items":[]});
-    state.notify("turn/started", json!({"threadId":thread_id,"turn":running}))?;
+    if let Err(error) = state.notify("turn/started", json!({"threadId":thread_id,"turn":running})) {
+        let _ = state.store.lock().unwrap().finish_turn(
+            &turn_id,
+            "failed",
+            Some("Unable to publish turn start"),
+        );
+        state.active.lock().unwrap().remove(thread_id);
+        return Err(error);
+    }
     let thread_id = thread_id.to_owned();
     tokio::spawn(async move {
-        let result = tokio::select! {biased;_=cancel.cancelled()=>Err(anyhow!("Turn interrupted")),result=runner::run_turn(ctx)=>result};
-        let status = if cancel.is_cancelled() {
+        let run = std::panic::AssertUnwindSafe(runner::run_turn(ctx)).catch_unwind();
+        let result = tokio::select! {biased;_=cancel.cancelled()=>Err(anyhow!("Turn interrupted")),result=run=>result.unwrap_or_else(|_|Err(anyhow!("Agent execution terminated unexpectedly")))};
+        let mut status = if cancel.is_cancelled() {
             "interrupted"
         } else if result.is_ok() {
             "completed"
         } else {
             "failed"
         };
-        let error = result.err().map(|e| e.to_string());
+        let mut error = result.err().map(|e| e.to_string());
         if let Ok(mut store) = state.store.lock() {
-            let _ = store.finish_turn(&turn_id, status, error.as_deref());
+            if store
+                .finish_turn(&turn_id, status, error.as_deref())
+                .is_err()
+            {
+                status = "failed";
+                error = Some("Unable to save the turn result".into());
+            }
         }
         state.active.lock().unwrap().remove(&thread_id);
         let _=state.notify("turn/completed",json!({"threadId":thread_id,"turn":{"id":turn_id,"status":status,"items":[],"error":error.map(|message|json!({"message":message}))}}));
@@ -454,9 +509,45 @@ mod tests {
                 .await
         });
         let _ = incoming.recv().await.context("No native request")?;
-        cancel.cancel();
-        assert!(request.await?.is_err());
+        // Aborting the outer turn drops the future rather than polling its
+        // cancellation select branch. This used to leave the pending entry.
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
         assert!(state.pending.lock().unwrap().is_empty());
+        cancel.cancel();
+        drop(state);
+        std::fs::remove_dir_all(home)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_start_notification_releases_thread_and_marks_failed() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("myagent-start-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home)?;
+        let mut store = Store::open(&home.join("test.sqlite"))?;
+        let thread =
+            store.create_thread(home.display().to_string(), String::new(), vec![], None)?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let state = Arc::new(State::new(store, sender));
+        *state.provider.lock().unwrap() = Some(ProviderConfig {
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1/v1".into(),
+            model: "fixture".into(),
+            api_key: None,
+        });
+        assert!(dispatch(
+            state.clone(),
+            "turn/start",
+            json!({"threadId":thread.id,"input":[{"type":"text","text":"hello"}]})
+        )
+        .await
+        .is_err());
+        assert!(state.active.lock().unwrap().is_empty());
+        assert_eq!(
+            state.store.lock().unwrap().turns(&thread.id)?[0]["status"],
+            "failed"
+        );
         drop(state);
         std::fs::remove_dir_all(home)?;
         Ok(())
