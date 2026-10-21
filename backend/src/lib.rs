@@ -212,8 +212,8 @@ pub async fn dispatch(state: Arc<State>, method: &str, params: Value) -> Result<
                 serde_json::from_value(params).context("Invalid provider configuration")?;
             // Constructing a provider validates URL and key without making an inference request.
             let _ = provider::Provider::new(config.clone())?;
-            let public =
-                json!({"provider":config.provider,"baseUrl":config.base_url,"model":config.model});
+            let auth_mode = config.auth_mode();
+            let public = json!({"provider":config.provider,"baseUrl":config.base_url,"model":config.model,"authMode":auth_mode});
             state
                 .store
                 .lock()
@@ -222,7 +222,7 @@ pub async fn dispatch(state: Arc<State>, method: &str, params: Value) -> Result<
             *state.provider.lock().unwrap() = Some(config);
             state.notify(
                 "account/updated",
-                json!({"authMode":"apikey","planType":null}),
+                json!({"authMode":auth_mode,"planType":null}),
             )?;
             Ok(json!({"configured":true,"configuration":public}))
         }
@@ -234,8 +234,17 @@ pub async fn dispatch(state: Arc<State>, method: &str, params: Value) -> Result<
         }
         "account/read" => {
             let provider = state.provider.lock().unwrap();
-            let account=provider.as_ref().map(|p|json!({"type":"apiKey","provider":p.provider,"email":format!("{} · {}",p.provider,p.model)}));
-            Ok(json!({"account":account,"requiresOpenaiAuth":true}))
+            let account = provider.as_ref().map(|p| {
+                let display_name = format!("{} · {}",p.provider,p.model);
+                if p.uses_api_key() {
+                    json!({"type":"apiKey","provider":p.provider,"email":display_name,"displayName":display_name})
+                } else {
+                    json!({"type":"local","provider":p.provider,"displayName":display_name})
+                }
+            });
+            Ok(
+                json!({"account":account,"authMode":provider.as_ref().map(ProviderConfig::auth_mode),"requiresOpenaiAuth":provider.as_ref().is_none_or(ProviderConfig::uses_api_key)}),
+            )
         }
         "account/logout" => {
             *state.provider.lock().unwrap() = None;
@@ -460,6 +469,97 @@ fn start_turn(state: Arc<State>, params: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_model_discovery_is_not_configuration_or_inference_authorization() -> Result<()> {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let home = std::env::temp_dir().join(format!("myagent-local-discovery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}/v1", listener.local_addr()?);
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let length = socket.read(&mut buffer).await.unwrap();
+                assert!(length > 0);
+                request.extend_from_slice(&buffer[..length]);
+                assert!(request.len() < 16_384);
+            }
+            let body = json!({"data":[{"id":"qwen3:8b"}]}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let store = Store::open(&home.join("test.sqlite"))?;
+        let (outgoing, mut events) = mpsc::unbounded_channel();
+        let state = Arc::new(State::new(store, outgoing));
+        let connection = json!({"provider":"local","baseUrl":address,"model":""});
+        let discovery = dispatch(state.clone(), "provider/test", connection.clone()).await?;
+        assert_eq!(discovery["models"], json!([{"id":"qwen3:8b"}]));
+        let request = fixture.await?;
+        assert!(request.starts_with("GET /v1/models "));
+        assert!(!request.to_lowercase().contains("authorization:"));
+        assert!(state.provider.lock().unwrap().is_none());
+        assert!(state.store.lock().unwrap().config("provider")?.is_none());
+        assert!(dispatch(state.clone(), "provider/configure", connection)
+            .await
+            .is_err());
+        assert!(state.provider.lock().unwrap().is_none());
+
+        let configured = dispatch(
+            state.clone(),
+            "provider/configure",
+            json!({"provider":"local","baseUrl":address,"model":"qwen3:8b"}),
+        )
+        .await?;
+        assert_eq!(configured["configuration"]["authMode"], "none");
+        let event = events.recv().await.context("configuration event missing")?;
+        assert_eq!(event["params"]["authMode"], "none");
+        let account = dispatch(state.clone(), "account/read", json!({})).await?;
+        assert_eq!(account["account"]["type"], "local");
+        assert!(account["account"].get("email").is_none());
+        assert_eq!(account["authMode"], "none");
+        assert_eq!(account["requiresOpenaiAuth"], false);
+        let saved = state.store.lock().unwrap().config("provider")?.unwrap();
+        assert_eq!(saved, configured["configuration"]);
+        assert!(saved.get("apiKey").is_none());
+        let thread = dispatch(state.clone(), "thread/start", json!({"cwd":home})).await?["thread"]
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for model in ["", "   ", "bad\nmodel"] {
+            assert!(dispatch(state.clone(),"turn/start",json!({"threadId":thread,"model":model,"input":[{"type":"text","text":"must select a real model"}]})).await.is_err());
+        }
+        assert!(state.active.lock().unwrap().is_empty());
+        assert!(state.store.lock().unwrap().turns(&thread)?.is_empty());
+        assert_eq!(
+            state.provider.lock().unwrap().as_ref().unwrap().model,
+            "qwen3:8b"
+        );
+
+        let keyed = dispatch(state.clone(),"provider/configure",json!({"provider":"custom","baseUrl":address,"model":"qwen3:8b","apiKey":"fixture-never-persist-key"})).await?;
+        assert_eq!(keyed["configuration"]["authMode"], "apikey");
+        let account = dispatch(state.clone(), "account/read", json!({})).await?;
+        assert_eq!(account["account"]["type"], "apiKey");
+        assert_eq!(account["authMode"], "apikey");
+        let saved = state
+            .store
+            .lock()
+            .unwrap()
+            .config("provider")?
+            .unwrap()
+            .to_string();
+        assert!(!saved.contains("fixture-never-persist-key"));
+        assert!(!saved.contains("apiKey"));
+        drop(state);
+        std::fs::remove_dir_all(home)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn native_reply_routes_by_id_and_cancellation_releases_pending() -> Result<()> {

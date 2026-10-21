@@ -19,6 +19,7 @@ final class AppModel: ObservableObject {
     @Published var connectionTestStatus = ""
     @Published var isTestingConnection = false
     @Published var showConnectionSetup = false
+    // Includes configured loopback providers that intentionally use no key.
     @Published var hasCredentials = false
     @Published var lastError: String?
     @Published var activities: [ActivityEntry] = []
@@ -47,9 +48,11 @@ final class AppModel: ObservableObject {
     private let browser = NativeBrowser()
     private let desktop = NativeDesktop()
     private var startupTask: Task<Void, Never>?
+    private var providerDisconnectTask: Task<Void, Never>?
     private var connectionEpoch = UUID()
     private var authenticated = false
     private var savedProvider = ProviderDraft()
+    private var connectionEnabled = false
     private var taskDrafts: [UUID: String] = [:]
     private var stateRevision: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     private var localSnapshotRevision: Int64 = 0
@@ -75,6 +78,15 @@ final class AppModel: ObservableObject {
     var currentTask: AgentTask? { tasks.first { $0.id == selectedTaskID } }
     var isBusy: Bool { activeTaskID != nil }
     var canRun: Bool { isConnected && hasCredentials && !isConnecting && !isTestingConnection }
+    var canRetainDraftKey: Bool {
+        connectionEnabled && hasCredentials && savedProvider.requiresAPIKey && providerDraft.requiresAPIKey
+            && credentialAccount(providerDraft) == credentialAccount(savedProvider)
+    }
+    var canTestConnection: Bool {
+        guard (try? providerDraft.endpoint()) != nil else { return false }
+        if !providerDraft.requiresAPIKey { return providerDraft.allowsNoKey }
+        return canRetainDraftKey || !apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     var canResumeTask: Bool {
         !isBusy && canRun && currentTask.map { [.paused, .failed].contains($0.phase) && !$0.messages.isEmpty } == true
     }
@@ -105,6 +117,7 @@ final class AppModel: ObservableObject {
                 selectedTaskID = state.selectedTaskID
                 settings = state.settings
                 if let provider = state.provider { providerDraft = provider; savedProvider = provider }
+                connectionEnabled = state.connectionEnabled ?? (state.provider != nil)
                 draft = tasks.first(where: { $0.id == selectedTaskID })?.draft ?? state.unassignedDraft ?? ""
             }
         } catch { lastError = "无法载入应用数据：\(error.localizedDescription)" }
@@ -141,6 +154,8 @@ final class AppModel: ObservableObject {
     private func startBackend(epoch: UUID) async {
         let initialSelection = selectedTaskID
         let initialDraft = draft
+        let initialProviderDraft = providerDraft
+        let restoreProviderDraft = providerDraft == savedProvider && !isTestingConnection
         connectionLabel = "正在启动本地后端"
         do {
             let binary: URL
@@ -177,7 +192,11 @@ final class AppModel: ObservableObject {
                             tasks = recovered
                             settings = state.settings
                             selectedTaskID = state.selectedTaskID
-                            if let provider = state.provider { providerDraft = provider; savedProvider = provider }
+                            if let provider = state.provider {
+                                savedProvider = provider
+                                if restoreProviderDraft && providerDraft == initialProviderDraft { providerDraft = provider }
+                            }
+                            connectionEnabled = state.connectionEnabled ?? (state.provider != nil)
                             draft = tasks.first(where: { $0.id == selectedTaskID })?.draft ?? state.unassignedDraft ?? ""
                         } else {
                             // Loading the backend must not replace text already typed during startup.
@@ -186,8 +205,16 @@ final class AppModel: ObservableObject {
                         }
                     }
                 }
-                if let key = try credentialStore.read(credentialAccount(savedProvider), allowInteraction: false) {
-                    _ = try await connection.call("provider/configure", params: providerParameters(savedProvider, key: key))
+                // An explicit connection test supplies its own candidate.
+                // Do not read a previous provider's credentials while starting
+                // a backend for that test (notably when switching to no-key).
+                if connectionEnabled && !isTestingConnection {
+                    if !savedProvider.requiresAPIKey {
+                        guard savedProvider.allowsNoKey else { throw AppFailure.message("无密钥连接仅可用于本机兼容服务，请检查模型配置。") }
+                        _ = try await connection.call("provider/configure", params: providerParameters(savedProvider, key: ""))
+                    } else if let key = try credentialStore.read(credentialAccount(savedProvider), allowInteraction: false) {
+                        _ = try await connection.call("provider/configure", params: providerParameters(savedProvider, key: key))
+                    }
                 }
             }
             try Task.checkCancellation()
@@ -205,9 +232,11 @@ final class AppModel: ObservableObject {
     }
 
     func reconnect() async {
+        guard !Task.isCancelled else { return }
         stop()
         let previous = startupTask
         connectionEpoch = UUID()
+        let epoch = connectionEpoch
         previous?.cancel()
         connection.stop()
         startupTask = nil
@@ -217,10 +246,12 @@ final class AppModel: ObservableObject {
         authenticated = false
         resumedThreads.removeAll()
         await previous?.value
+        guard epoch == connectionEpoch, !Task.isCancelled else { return }
         await connect()
     }
 
     func shutdown() {
+        providerDisconnectTask?.cancel()
         connectionEpoch = UUID()
         startupTask?.cancel()
         startupTask = nil
@@ -235,7 +266,9 @@ final class AppModel: ObservableObject {
     }
 
     func shutdownAndWait() async throws {
+        let disconnect = providerDisconnectTask
         shutdown()
+        await disconnect?.value
         try await connection.stopAndWait()
     }
 
@@ -245,7 +278,7 @@ final class AppModel: ObservableObject {
             if let account = result["account"] as? [String: Any] {
                 authenticated = true
                 hasCredentials = true
-                accountLabel = account["email"] as? String ?? "模型已配置"
+                accountLabel = account["displayName"] as? String ?? account["email"] as? String ?? "模型已配置"
             } else {
                 authenticated = false
                 hasCredentials = false
@@ -266,6 +299,11 @@ final class AppModel: ObservableObject {
     }
 
     private func keyForDraft(_ provider: ProviderDraft, enteredKey: String) throws -> String {
+        _ = try provider.endpoint()
+        if !provider.requiresAPIKey {
+            guard provider.allowsNoKey else { throw AppFailure.message("无密钥模式仅支持本机地址。远端服务请选择 API Key。") }
+            return ""
+        }
         let entered = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !entered.isEmpty { return entered }
         if let stored = try credentialStore.read(credentialAccount(provider), allowInteraction: true), !stored.isEmpty { return stored }
@@ -285,38 +323,51 @@ final class AppModel: ObservableObject {
         Task {
             defer { isTestingConnection = false }
             do {
+                if save, candidate.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    throw AppFailure.message("请先获取模型列表并选择模型，再保存连接。")
+                }
+                let key = try keyForDraft(candidate, enteredKey: enteredKey)
                 if !isConnected {
                     await connect()
                 }
                 guard isConnected else { throw AppFailure.message("本地后端未启动，请先重新连接。") }
-                let key = try keyForDraft(candidate, enteredKey: enteredKey)
                 let result = try await connection.call("provider/test", params: providerParameters(candidate, key: key))
                 guard result["reachable"] as? Bool == true else { throw AppFailure.message("模型服务尚未通过连接检查。") }
                 let rows = result["models"] as? [[String: Any]] ?? []
                 let ids = rows.compactMap { $0["id"] as? String }
                 models = ids.map { ModelOption(id: $0, displayName: $0, isDefault: $0 == candidate.model) }
                 connectionTestStatus = "连接成功，可用模型 \(ids.count) 个。"
+                if !save, candidate.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if ids.count == 1 { providerDraft.model = ids[0] }
+                    connectionTestStatus += ids.isEmpty ? "请先在模型服务中准备可用模型。" : ids.count == 1 ? "已选中唯一模型；保存后可用于任务。" : "请选择一个模型，再保存使用。"
+                }
                 if save {
                     if !ids.isEmpty && !ids.contains(candidate.model.trimmingCharacters(in: .whitespacesAndNewlines)) {
                         throw AppFailure.message("服务已连接，但模型列表中没有“\(candidate.model)”。请填写返回的实际模型 ID。")
                     }
-                    let account = credentialAccount(candidate)
-                    let oldKey = try credentialStore.read(account, allowInteraction: true)
-                    // Persist first. A Keychain failure must never activate an unsaved provider.
-                    try credentialStore.save(key, account: account)
-                    do {
-                        _ = try await connection.call("provider/configure", params: providerParameters(candidate, key: key))
-                    } catch {
+                    if candidate.kind == "local", ids.isEmpty { throw AppFailure.message("本机服务未返回可用模型，请先准备模型后重试。") }
+                    if candidate.requiresAPIKey {
+                        let account = credentialAccount(candidate)
+                        let oldKey = try credentialStore.read(account, allowInteraction: true)
+                        // Persist first. A Keychain failure must never activate an unsaved provider.
+                        try credentialStore.save(key, account: account)
                         do {
-                            if let oldKey { try credentialStore.save(oldKey, account: account) }
-                            else { try credentialStore.remove(account) }
-                        } catch { lastError = "连接未启用，恢复原钥匙串记录失败：\(error.localizedDescription)" }
-                        throw error
+                            _ = try await connection.call("provider/configure", params: providerParameters(candidate, key: key))
+                        } catch {
+                            do {
+                                if let oldKey { try credentialStore.save(oldKey, account: account) }
+                                else { try credentialStore.remove(account) }
+                            } catch { lastError = "连接未启用，恢复原钥匙串记录失败：\(error.localizedDescription)" }
+                            throw error
+                        }
+                    } else {
+                        _ = try await connection.call("provider/configure", params: providerParameters(candidate, key: key))
                     }
                     var normalized = candidate
                     normalized.baseURL = candidate.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     normalized.model = candidate.model.trimmingCharacters(in: .whitespacesAndNewlines)
                     savedProvider = normalized
+                    connectionEnabled = true
                     providerDraft = normalized
                     settings.model = normalized.model
                     apiKeyDraft = ""
@@ -324,7 +375,7 @@ final class AppModel: ObservableObject {
                     connectionLabel = "本地后端已连接"
                     showConnectionSetup = false
                     persist()
-                    log("模型连接已保存", "\(candidate.kind) · \(candidate.model)。密钥在本机钥匙串中。")
+                    log("模型连接已保存", "\(candidate.kind) · \(candidate.model)。" + (candidate.requiresAPIKey ? "密钥在本机钥匙串中。" : "使用本机无密钥模式。"))
                 }
             } catch {
                 connectionTestStatus = "连接失败：\(error.localizedDescription)"
@@ -333,14 +384,19 @@ final class AppModel: ObservableObject {
     }
 
     func disconnectProvider() {
-        guard !isBusy else { lastError = "请先停止正在执行的任务。"; return }
-        do { try credentialStore.remove(credentialAccount(savedProvider)) }
+        guard !isBusy, !isTestingConnection, !isConnecting, providerDisconnectTask == nil else { lastError = "请先停止任务并等待连接操作完成。"; return }
+        do { if savedProvider.requiresAPIKey, connectionEnabled { try credentialStore.remove(credentialAccount(savedProvider)) } }
         catch { lastError = error.localizedDescription; return }
         hasCredentials = false
         authenticated = false
         apiKeyDraft = ""
         accountLabel = "尚未配置模型"
-        Task { await reconnect() }
+        connectionEnabled = false
+        persist()
+        providerDisconnectTask = Task {
+            defer { providerDisconnectTask = nil }
+            await reconnect()
+        }
     }
 
     private func refreshModels() async {
@@ -947,7 +1003,7 @@ final class AppModel: ObservableObject {
         do {
             stateRevision = max(stateRevision + 1, Int64(Date().timeIntervalSince1970 * 1_000))
             localSnapshotRevision = stateRevision
-            let state = PersistedAppState(selectedTaskID: selectedTaskID, tasks: tasks, settings: settings, provider: savedProvider, unassignedDraft: selectedTaskID == nil ? draft : nil, revision: stateRevision)
+            let state = PersistedAppState(selectedTaskID: selectedTaskID, tasks: tasks, settings: settings, provider: savedProvider, unassignedDraft: selectedTaskID == nil ? draft : nil, revision: stateRevision, connectionEnabled: connectionEnabled)
             let data = try JSONEncoder().encode(state)
             try data.write(to: stateFile, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateFile.path)

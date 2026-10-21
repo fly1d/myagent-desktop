@@ -4,10 +4,10 @@ The backend is an independent Rust JSONL process. It accepts the existing launch
 
 ## Provider RPCs
 
-- `provider/configure`: `{provider, baseUrl, model, apiKey}`. All are strings. `baseUrl` is an OpenAI-compatible API root, normally ending in `/v1`. Cloud providers require a nonempty key; a local loopback development endpoint may omit it. Persists only `provider`, `baseUrl` and `model`, returns `{configured:true,configuration:{provider,baseUrl,model}}`.
-- `provider/test`: same three fields, tests the supplied configuration without saving it. Returns the provider module's JSON result or a JSON-RPC error. Never returns or logs the key.
+- `provider/configure`: `{provider, baseUrl, model, apiKey?}`. `baseUrl` is an OpenAI-compatible API root, normally ending in `/v1`. Cloud providers require a nonempty key; a local loopback endpoint may omit it. A nonempty valid model ID is required. Persists only `provider`, `baseUrl`, `model`, and derived `authMode` (`apikey` or `none`), returns `{configured:true,configuration:{provider,baseUrl,model,authMode}}`.
+- `provider/test`: same fields, permits `model:""` to discover `/models` before choosing a model. Validates address/key, tests without saving or enabling inference, and returns `{reachable:true,models:[{id}],label}` or a JSON-RPC error. Never returns or logs the key. Configuration and completion still apply full model validation.
 - `backend/health`: reports backend identity, SQLite schema, configured state, and version.
-- `account/read`: returns `{account:{type:"apiKey",provider,email}|null, requiresOpenaiAuth:true}`. This is model-provider configuration, not a product account system.
+- `account/read`: keyed providers return `{account:{type:"apiKey",provider,email,displayName},authMode:"apikey",requiresOpenaiAuth:true}`. Configured no-key loopback providers return `{account:{type:"local",provider,displayName},authMode:"none",requiresOpenaiAuth:false}` without a fabricated email. Unconfigured account/authMode are null. This describes model-provider configuration, not a product account system.
 - `model/list`: returns the configured model in the existing `{data,nextCursor:null}` shape.
 
 ## Shared Rust API

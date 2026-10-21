@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum RunPhase: String, Codable {
     case idle, connecting, running, waiting, needsReview, paused, completed, failed
@@ -102,10 +103,51 @@ struct AppSettings: Codable {
     var maxAutomaticRounds = 2
 }
 
+enum ProviderAuthentication: String, Codable {
+    case apiKey, none
+}
+
 struct ProviderDraft: Codable, Equatable {
     var kind = "deepseek"
     var baseURL = "https://api.deepseek.com"
     var model = "deepseek-chat"
+    // Optional for snapshots written before explicit authentication modes.
+    var authentication: ProviderAuthentication? = nil
+
+    var authMode: ProviderAuthentication { authentication ?? .apiKey }
+    var requiresAPIKey: Bool { authMode == .apiKey }
+    var allowsNoKey: Bool {
+        ["custom", "local"].contains(kind) && (try? endpoint()).map(Self.isLoopback) == true
+    }
+
+    func endpoint() throws -> URL {
+        let text = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: text), let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              !text.components(separatedBy: "://").dropFirst().joined(separator: "://").prefix(while: { $0 != "/" }).contains("@") else {
+            throw AppFailure.message("请填写有效的 API 根地址，不含账号、密码、查询参数或片段。")
+        }
+        let scheme = url.scheme?.lowercased()
+        guard scheme == "https" || (scheme == "http" && Self.isLoopback(url)) else {
+            throw AppFailure.message("远端模型服务需要 HTTPS；HTTP 仅可用于本机地址。")
+        }
+        return url
+    }
+
+    private static func isLoopback(_ url: URL) -> Bool {
+        guard var host = url.host?.lowercased() else { return false }
+        if host == "localhost" { return true }
+        if host.hasPrefix("["), host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, host, &ipv4) == 1 {
+            return withUnsafeBytes(of: ipv4) { $0.first == 127 }
+        }
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, host, &ipv6) == 1 {
+            return withUnsafeBytes(of: ipv6) { bytes in bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1 }
+        }
+        return false
+    }
 }
 
 struct PersistedAppState: Codable {
@@ -116,6 +158,7 @@ struct PersistedAppState: Codable {
     var provider: ProviderDraft? = nil
     var unassignedDraft: String? = nil
     var revision: Int64? = nil
+    var connectionEnabled: Bool? = nil
 }
 
 enum AppFailure: LocalizedError {

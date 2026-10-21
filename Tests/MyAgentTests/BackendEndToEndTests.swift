@@ -8,6 +8,200 @@ import Testing
 @MainActor
 struct BackendEndToEndTests {
     @Test(.timeLimit(.minutes(1)))
+    func localUnauthenticatedDiscoveryDeliveryAndDisconnectNeverTouchCredentialStore() async throws {
+        let fixture = try await HTTPModelFixture.start(allowUnauthenticated: true)
+        let secrets = RejectingCredentialStore()
+        let model = fixture.makeModel(secrets)
+        var reopened: AppModel?
+        var afterDisconnect: AppModel?
+        do {
+            await model.connect()
+            var local = ProviderDraft(kind: "local", baseURL: fixture.address, model: "")
+            local.authentication = .some(.none)
+            model.providerDraft = local
+            model.apiKeyDraft = ""
+            model.saveConnection()
+            try await eventually("empty model cannot be saved even for local no-key mode") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接失败"))
+            #expect(!model.canRun)
+            #expect(fixture.httpRequests.isEmpty)
+            #expect(secrets.operations.isEmpty)
+
+            model.testConnection()
+            try await eventually("local endpoint discovers its single real model") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接成功"))
+            #expect(model.providerDraft.model == "fixture-agent")
+            #expect(fixture.httpRequests.contains { $0["method"] as? String == "GET" && $0["path"] as? String == "/v1/models" })
+            #expect(secrets.operations.isEmpty)
+            model.saveConnection()
+            try await eventually("local connection saves without a key") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接成功"))
+            #expect(model.canRun)
+            #expect(model.apiKeyDraft.isEmpty)
+            model.settings.proactive = false
+            model.draft = "write-report"
+            model.sendPrompt()
+            try await eventually("no-key task reaches real file approval") { model.pendingPermission != nil }
+            model.respondPermission(true)
+            try await eventually("no-key task writes reads and verifies") { !model.isBusy }
+            #expect(model.currentTask?.phase == .completed)
+            #expect(try String(contentsOf: fixture.report, encoding: .utf8) == "你好，后端实际写入。\n")
+            #expect(try fixture.receipts().count == 1)
+            #expect(secrets.operations.isEmpty)
+            let taskID = try #require(model.selectedTaskID)
+            try await model.shutdownAndWait()
+
+            let restored = fixture.makeModel(secrets)
+            reopened = restored
+            await restored.connect()
+            #expect(restored.canRun)
+            #expect(restored.selectedTaskID == taskID)
+            #expect(restored.currentTask?.phase == .completed)
+            #expect(restored.providerDraft.kind == "local")
+            #expect(restored.providerDraft.baseURL == fixture.address)
+            #expect(restored.providerDraft.model == "fixture-agent")
+            #expect(restored.providerDraft.authentication == .some(.none))
+            #expect(secrets.operations.isEmpty)
+            restored.disconnectProvider()
+            try await eventually("local provider disconnects") { !restored.canRun }
+            try await restored.shutdownAndWait()
+
+            let disconnected = fixture.makeModel(secrets)
+            afterDisconnect = disconnected
+            await disconnected.connect()
+            #expect(!disconnected.canRun)
+            #expect(disconnected.isConnected)
+            #expect(disconnected.providerDraft.kind == "local")
+            #expect(disconnected.providerDraft.baseURL == fixture.address)
+            #expect(disconnected.providerDraft.model == "fixture-agent")
+            #expect(disconnected.providerDraft.authentication == .some(.none))
+            #expect(secrets.operations.isEmpty)
+            #expect(!fixture.httpRequests.isEmpty)
+            #expect(fixture.httpRequests.allSatisfy { $0["authorizationPresent"] as? Bool == false })
+            try await disconnected.shutdownAndWait()
+        } catch {
+            try? await model.shutdownAndWait()
+            if let reopened { try? await reopened.shutdownAndWait() }
+            if let afterDisconnect { try? await afterDisconnect.shutdownAndWait() }
+            fixture.stop()
+            throw error
+        }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func localNoKeyTestAndSaveWithUnavailableBackendDoNotReadPreviousProviderKey() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let secrets = GateableCredentialStore()
+        let model = fixture.makeModel(secrets)
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            #expect(secrets.values.count == 1)
+            let originalKeys = secrets.values
+            let originalOperations = secrets.operations
+            let originalRequests = fixture.httpRequests.count
+            try await model.shutdownAndWait()
+            #expect(!model.isConnected)
+            secrets.rejectReads = true
+            try Data().write(to: fixture.directory.appendingPathComponent("allow-unauthenticated-local-fixture"))
+
+            model.providerDraft = ProviderDraft(kind: "local", baseURL: fixture.address, model: "", authentication: .some(.none))
+            model.apiKeyDraft = ""
+            model.testConnection()
+            try await eventually("local no-key discovery starts an unavailable backend without restoring the old key") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接成功"))
+            #expect(model.providerDraft.kind == "local")
+            #expect(model.providerDraft.model == "fixture-agent")
+            #expect(model.providerDraft.authentication == .some(.none))
+            #expect(model.lastError == nil)
+            #expect(secrets.operations == originalOperations)
+            #expect(secrets.values == originalKeys)
+            #expect(!model.canRun)
+
+            // Saving must also survive a fresh backend start while the old
+            // enabled key configuration still exists in persistent state.
+            try await model.shutdownAndWait()
+            #expect(!model.isConnected)
+            model.saveConnection()
+            try await eventually("local no-key save starts an unavailable backend without reading the old key") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接成功"))
+            #expect(model.canRun)
+            #expect(model.lastError == nil)
+            #expect(secrets.operations == originalOperations)
+            #expect(secrets.values == originalKeys)
+
+            model.settings.proactive = false
+            model.draft = "write-report"
+            model.sendPrompt()
+            try await eventually("replacement no-key provider reaches actual file approval") { model.pendingPermission != nil }
+            model.respondPermission(true)
+            try await eventually("replacement no-key provider completes actual delivery") { !model.isBusy }
+            #expect(model.currentTask?.phase == .completed)
+            #expect(try String(contentsOf: fixture.report, encoding: .utf8) == "你好，后端实际写入。\n")
+            #expect(try fixture.receipts().count == 1)
+            #expect(model.lastError == nil)
+            #expect(secrets.operations == originalOperations)
+            #expect(secrets.values == originalKeys)
+            let localRequests = fixture.httpRequests.dropFirst(originalRequests)
+            #expect(!localRequests.isEmpty)
+            #expect(localRequests.allSatisfy { $0["authorizationPresent"] as? Bool == false })
+            try await model.shutdownAndWait()
+        } catch { try? await model.shutdownAndWait(); fixture.stop(); throw error }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func remoteUnauthenticatedDraftIsRejectedBeforeHTTPAndKeepsWorkingSavedProvider() async throws {
+        let fixture = try await HTTPModelFixture.start()
+        let secrets = MemoryCredentialStore()
+        let model = fixture.makeModel(secrets)
+        do {
+            await model.connect()
+            try await configure(model, fixture)
+            let savedKeys = secrets.values
+            let credentialReads = secrets.attemptedAccounts.count
+            let requests = fixture.httpRequests.count
+            var remote = ProviderDraft(kind: "custom", baseURL: "https://must-not-contact.invalid/v1", model: "fixture-agent")
+            remote.authentication = .some(.none)
+            model.providerDraft = remote
+            model.apiKeyDraft = ""
+            model.testConnection()
+            try await eventually("remote no-key discovery is blocked") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接失败"))
+            #expect(model.connectionTestStatus.contains("无密钥模式仅支持本机地址"))
+            #expect(fixture.httpRequests.count == requests)
+            #expect(secrets.attemptedAccounts.count == credentialReads)
+            #expect(secrets.values == savedKeys)
+            #expect(model.canRun)
+            model.saveConnection()
+            try await eventually("remote no-key save is blocked") { !model.isTestingConnection }
+            #expect(model.connectionTestStatus.hasPrefix("连接失败"))
+            #expect(model.connectionTestStatus.contains("无密钥模式仅支持本机地址"))
+            #expect(fixture.httpRequests.count == requests)
+            #expect(secrets.attemptedAccounts.count == credentialReads)
+            #expect(secrets.values == savedKeys)
+            #expect(model.canRun)
+
+            // A runnable label alone is insufficient: the previous saved key
+            // and endpoint must still complete a real production tool loop.
+            model.settings.proactive = false
+            model.draft = "write-report"
+            model.sendPrompt()
+            try await eventually("saved key provider still requests its actual write") { model.pendingPermission != nil }
+            model.respondPermission(true)
+            try await eventually("saved provider survives invalid draft") { !model.isBusy }
+            #expect(model.currentTask?.phase == .completed)
+            #expect(try String(contentsOf: fixture.report, encoding: .utf8) == "你好，后端实际写入。\n")
+            #expect(try fixture.receipts().count == 1)
+            #expect(secrets.values == savedKeys)
+            #expect(fixture.httpRequests.allSatisfy { $0["authorizationPresent"] as? Bool == true })
+            try await model.shutdownAndWait()
+        } catch { try? await model.shutdownAndWait(); fixture.stop(); throw error }
+        fixture.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func productionClientAndBackendWriteReadVerifyAndRestoreWithoutLeakingCredential() async throws {
         let fixture = try await HTTPModelFixture.start()
         let secrets = MemoryCredentialStore()
@@ -322,6 +516,43 @@ struct BackendEndToEndTests {
 }
 
 @MainActor
+private final class RejectingCredentialStore: CredentialStore {
+    private(set) var operations: [String] = []
+    func read(_ account: String, allowInteraction: Bool) throws -> String? {
+        operations.append("read")
+        throw AppFailure.message("No-key test forbids CredentialStore reads")
+    }
+    func save(_ secret: String, account: String) throws {
+        operations.append("save")
+        throw AppFailure.message("No-key test forbids CredentialStore writes")
+    }
+    func remove(_ account: String) throws {
+        operations.append("remove")
+        throw AppFailure.message("No-key test forbids CredentialStore deletes")
+    }
+}
+
+@MainActor
+private final class GateableCredentialStore: CredentialStore {
+    var rejectReads = false
+    private(set) var values: [String: String] = [:]
+    private(set) var operations: [String] = []
+    func read(_ account: String, allowInteraction: Bool) throws -> String? {
+        operations.append("read")
+        if rejectReads { throw AppFailure.message("Previous provider Keychain read is forbidden in local no-key mode") }
+        return values[account]
+    }
+    func save(_ secret: String, account: String) throws {
+        operations.append("save")
+        values[account] = secret
+    }
+    func remove(_ account: String) throws {
+        operations.append("remove")
+        values.removeValue(forKey: account)
+    }
+}
+
+@MainActor
 private final class HTTPModelFixture {
     static let key = "myagent-e2e-fixture-key-not-a-real-credential"
     let directory: URL
@@ -339,6 +570,13 @@ private final class HTTPModelFixture {
             return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
         }
     }
+    var httpRequests: [[String: Any]] {
+        guard let text = try? String(contentsOf: directory.appendingPathComponent("http-requests.jsonl"), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap { line in
+            guard let bytes = String(line).data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
+        }
+    }
     var lastQuestionResult: [String: Any]? {
         guard let bytes = try? Data(contentsOf: directory.appendingPathComponent("question-result.json")) else { return nil }
         return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
@@ -351,9 +589,12 @@ private final class HTTPModelFixture {
         }
     }
 
-    private init() throws {
+    private init(allowUnauthenticated: Bool) throws {
         directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("myagent-e2e-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        if allowUnauthenticated {
+            try Data().write(to: directory.appendingPathComponent("allow-unauthenticated-local-fixture"))
+        }
         let script = directory.appendingPathComponent("model.py")
         try Data(Self.source.utf8).write(to: script)
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -374,8 +615,8 @@ private final class HTTPModelFixture {
         }
     }
 
-    static func start() async throws -> HTTPModelFixture {
-        let fixture = try HTTPModelFixture()
+    static func start(allowUnauthenticated: Bool = false) async throws -> HTTPModelFixture {
+        let fixture = try HTTPModelFixture(allowUnauthenticated: allowUnauthenticated)
         let deadline = ProcessInfo.processInfo.systemUptime + 20
         while true {
             guard fixture.process.isRunning else {
@@ -416,7 +657,7 @@ private final class HTTPModelFixture {
         return AppFailure.message("HTTP model fixture \(reason).\nFixture stderr (last 4 KB):\n\(diagnostic)")
     }
 
-    func makeModel(_ secrets: MemoryCredentialStore) -> AppModel {
+    func makeModel(_ secrets: any CredentialStore) -> AppModel {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         return AppModel(dataDirectory: data, engineBinary: root.appendingPathComponent("backend/target/debug/myagent-backend"), credentialStore: secrets, usesBackendPersistence: true)
     }
@@ -439,14 +680,23 @@ private final class HTTPModelFixture {
     root = pathlib.Path(sys.argv[1]); count = 0
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_): pass
+        def authenticate(self):
+            actual = self.headers.get('Authorization')
+            with (root/'http-requests.jsonl').open('a') as log:
+                log.write(json.dumps({'method':self.command,'path':self.path,'authorizationPresent':actual is not None})+'\n')
+            no_key = (root/'allow-unauthenticated-local-fixture').exists()
+            accepted = actual is None if no_key else actual == 'Bearer myagent-e2e-fixture-key-not-a-real-credential'
+            if not accepted: self.send_error(401)
+            return accepted
         def do_GET(self):
             if self.path != '/v1/models': self.send_error(404); return
+            if not self.authenticate(): return
             data = json.dumps({'data':[{'id':'fixture-agent'}]}).encode()
             self.send_response(200); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
         def do_POST(self):
             global count
             if self.path != '/v1/chat/completions': self.send_error(404); return
-            if self.headers.get('Authorization') != 'Bearer myagent-e2e-fixture-key-not-a-real-credential': self.send_error(401); return
+            if not self.authenticate(): return
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['model'] == 'fixture-agent'
             names = {t['function']['name'] for t in request['tools']}

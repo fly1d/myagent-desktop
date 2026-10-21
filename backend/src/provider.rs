@@ -68,21 +68,10 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderConfig {
-    pub fn validate(&self) -> Result<(), ProviderError> {
-        validate_base_url(&self.base_url)?;
-        if self.model.trim().is_empty() || self.model.len() > 256 {
-            return Err(ProviderError::Configuration(
-                "请提供有效的模型 ID（最多 256 字节）。",
-            ));
-        }
-        let url = Url::parse(&self.base_url)
-            .map_err(|_| ProviderError::Configuration("模型服务地址无效。"))?;
-        if !is_loopback(&url)
-            && self
-                .api_key
-                .as_deref()
-                .is_none_or(|key| key.trim().is_empty())
-        {
+    /// Discovery checks the endpoint and credentials without inventing a model.
+    pub fn validate_connection(&self) -> Result<(), ProviderError> {
+        let url = validate_base_url(&self.base_url)?;
+        if !is_loopback(&url) && !self.uses_api_key() {
             return Err(ProviderError::Configuration("远程模型服务需要 API Key。"));
         }
         if self
@@ -94,6 +83,40 @@ impl ProviderConfig {
         }
         Ok(())
     }
+
+    /// Saved configurations and inference additionally require an explicit ID.
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        self.validate_connection()?;
+        if !valid_model_id(&self.model) {
+            return Err(ProviderError::Configuration(
+                "请提供有效的模型 ID（最多 256 字节，不含控制字符或首尾空白）。",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn uses_api_key(&self) -> bool {
+        self.effective_api_key().is_some()
+    }
+
+    pub fn auth_mode(&self) -> &'static str {
+        if self.uses_api_key() {
+            "apikey"
+        } else {
+            "none"
+        }
+    }
+
+    fn effective_api_key(&self) -> Option<&str> {
+        self.api_key.as_deref().filter(|key| !key.trim().is_empty())
+    }
+}
+
+fn valid_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 256
+        && model.trim() == model
+        && !model.chars().any(char::is_control)
 }
 
 pub fn validate_base_url(value: &str) -> Result<Url, ProviderError> {
@@ -166,6 +189,15 @@ impl fmt::Debug for Completion {
 impl Provider {
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
         config.validate()?;
+        Self::build(config)
+    }
+
+    fn for_discovery(config: ProviderConfig) -> Result<Self, ProviderError> {
+        config.validate_connection()?;
+        Self::build(config)
+    }
+
+    fn build(config: ProviderConfig) -> Result<Self, ProviderError> {
         let client = Client::builder()
             .redirect(Policy::none())
             .no_proxy()
@@ -191,12 +223,7 @@ impl Provider {
                 "application/json"
             },
         );
-        match self
-            .config
-            .api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-        {
+        match self.config.effective_api_key() {
             Some(key) => request.bearer_auth(key),
             None => request,
         }
@@ -235,13 +262,11 @@ impl Provider {
             if let Some(id) = row
                 .get("id")
                 .and_then(Value::as_str)
-                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .filter(|id| valid_model_id(id))
             {
                 if self
                     .config
-                    .api_key
-                    .as_deref()
-                    .filter(|key| !key.is_empty())
+                    .effective_api_key()
                     .is_some_and(|key| id.contains(key))
                 {
                     continue;
@@ -259,6 +284,8 @@ impl Provider {
         cancel: &CancellationToken,
         deltas: mpsc::Sender<String>,
     ) -> Result<Completion, ProviderError> {
+        // A discovery-only provider must never start inference with model:"".
+        self.config.validate()?;
         let messages = self.prepare_messages(messages);
         let mut body = json!({"model":self.config.model,"messages":messages,"stream":true});
         if !tools.is_empty() {
@@ -374,12 +401,13 @@ fn check_status(status: StatusCode) -> Result<(), ProviderError> {
 }
 
 pub async fn test_provider(config: &ProviderConfig) -> anyhow::Result<Value> {
-    let provider = Provider::new(config.clone())?;
+    let provider = Provider::for_discovery(config.clone())?;
     let models = provider.models(&CancellationToken::new()).await?;
     let label = match config.provider.to_lowercase().as_str() {
         "openai" => "OpenAI",
         "deepseek" => "DeepSeek",
         "ollama" => "Ollama",
+        "local" => "本机模型服务",
         _ => "OpenAI-compatible",
     };
     Ok(json!({"reachable":true,"models":models,"label":label}))
@@ -660,6 +688,79 @@ mod tests {
     }
 
     #[test]
+    fn discovery_validation_does_not_invent_an_inference_model() {
+        let mut config = fixture_config("http://127.0.0.1:11434/v1".into());
+        config.model.clear();
+        config.api_key = None;
+        assert!(config.validate_connection().is_ok());
+        assert!(config.validate().is_err());
+        assert!(Provider::new(config.clone()).is_err());
+        assert!(Provider::for_discovery(config.clone()).is_ok());
+        for model in ["", "   ", " model", "model ", "model\n", "model\0"] {
+            config.model = model.into();
+            assert!(config.validate_connection().is_ok());
+            assert!(config.validate().is_err());
+        }
+        config.model = "qwen3:8b".into();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.auth_mode(), "none");
+        config.base_url = "https://api.example.com/v1".into();
+        assert!(config.validate_connection().is_err());
+        config.api_key = Some("fixture-key".into());
+        assert!(config.validate_connection().is_ok());
+        assert_eq!(config.auth_mode(), "apikey");
+        config.model.clear();
+        assert!(config.validate_connection().is_ok());
+        assert!(config.validate().is_err());
+        config.base_url = "http://api.example.com/v1".into();
+        assert!(config.validate_connection().is_err());
+    }
+
+    #[test]
+    fn no_key_is_confined_to_parsed_loopback_hosts_not_lan_or_lookalikes() {
+        for address in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://127.10.20.30:11434/v1",
+            "http://[::1]:11434/v1",
+            "https://[::1]:11434/v1",
+        ] {
+            let mut config = fixture_config(address.into());
+            config.api_key = None;
+            assert!(config.validate_connection().is_ok(), "{address}");
+        }
+        for authority in [
+            "localhost.evil.example:11434",
+            "localhostevil.example:11434",
+            "localhost.:11434",
+            "127.0.0.1.evil.example:11434",
+            "127.0.0.1-evil.example:11434",
+            "127evil.example:11434",
+            "127.0.0.1%2eevil.example:11434",
+            "locаlhost:11434",
+            "127.0.0.1@evil.example:11434",
+            "[::1]@evil.example:11434",
+            "[::1].evil.example:11434",
+            "192.168.1.2:11434",
+            "10.0.0.2:11434",
+            "128.0.0.1:11434",
+            "0.0.0.0:11434",
+            "[::]:11434",
+            "[::10]:11434",
+            "[fe80::1]:11434",
+            "[::ffff:127.0.0.1]:11434",
+            "[::1%25lo0]:11434",
+        ] {
+            for scheme in ["http", "https"] {
+                let address = format!("{scheme}://{authority}/v1");
+                let mut config = fixture_config(address.clone());
+                config.api_key = None;
+                assert!(config.validate_connection().is_err(), "{address}");
+            }
+        }
+    }
+
+    #[test]
     fn sse_preserves_chinese_utf8_and_reassembles_tool_arguments() {
         let source = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\r\n\r\n",
@@ -828,6 +929,38 @@ mod tests {
             base_url,
             model: "fixture-model".into(),
             api_key: Some("fixture-only-secret".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_model_discovers_real_local_models_without_authorization_header() {
+        for key in [None, Some(String::new()), Some("   ".into())] {
+            let (address,server) = http_fixture("200 OK","",json!({"data":[{"id":"qwen3:8b"},{"id":"actual   local model"},{"id":" invalid "},{"id":"\n"}]}).to_string()).await;
+            let mut config = fixture_config(address);
+            config.provider = "local".into();
+            config.model.clear();
+            config.api_key = key;
+            let discovered = test_provider(&config).await.unwrap();
+            assert_eq!(discovered["reachable"], true);
+            assert_eq!(
+                discovered["models"],
+                json!([{"id":"qwen3:8b"},{"id":"actual   local model"}])
+            );
+            assert!(discovered.get("model").is_none());
+            let request = server.await.unwrap();
+            assert!(request.starts_with("GET /v1/models "));
+            assert!(!request.to_lowercase().contains("authorization:"));
+            let discovery = Provider::for_discovery(config).unwrap();
+            let (sender, _receiver) = mpsc::channel(1);
+            let attempted = discovery
+                .complete(
+                    vec![json!({"role":"user","content":"must select a model first"})],
+                    vec![],
+                    &CancellationToken::new(),
+                    sender,
+                )
+                .await;
+            assert!(matches!(attempted, Err(ProviderError::Configuration(_))));
         }
     }
 

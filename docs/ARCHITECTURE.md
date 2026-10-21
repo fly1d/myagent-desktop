@@ -17,11 +17,13 @@ myagent-backend（本项目 Rust 程序）
 
 ## 配置
 
-`ProviderDraft` 只包含供应商、API 地址和模型。`SecureStore` 使用系统 Keychain Generic Password，按供应商和地址索引；更改地址不会自动取得旧服务的密钥。测试调用 `provider/test` 实际请求服务；明确保存后才写入钥匙串。
+`ProviderDraft` 包含供应商、API 地址、模型和公开鉴权方式；旧快照缺少鉴权字段时默认 API Key。`SecureStore` 使用系统 Keychain Generic Password，按供应商和地址索引；更改地址不会自动取得旧服务的密钥。测试调用 `provider/test` 实际请求模型列表，允许模型名为空；配置与执行仍严格校验模型。多个模型由用户选择，只有一个且原输入为空时自动填入。
 
 后端 `ProviderConfig` 在内存携带密钥；数据库只存公开配置。进程间使用父子管道，不监听局域网端口。`provider.rs` 负责地址与 TLS、HTTP 错误、流式文本和函数调用参数的解析，可增加其他协议适配器。
 
 连接保存先成功写入钥匙串，再启用后端；启用失败恢复原记录。后台恢复不弹系统认证窗口，用户主动测试/保存时允许系统确认。CredentialStore 支持注入测试存储；系统钥匙串回归使用独立随机 service。连接启动采用单航班，重连先等待旧进程释放数据库。
+
+本机无密钥模式仅接受精确 localhost、127/8 和 ::1 回环地址，Swift 表单与 Rust 服务端分别检查；远端继续要求 HTTPS 和密钥。该模式不调用 CredentialStore。显式测试/保存重启后端时也跳过旧供应商凭据恢复。`connectionEnabled` 单独持久化启用意图，断开后保留公开表单且重开不自动配置；旧快照按已存 provider 迁移。断开后的异步重连纳入 shutdown 取消与 epoch 检查。
 
 ## 执行与恢复
 
